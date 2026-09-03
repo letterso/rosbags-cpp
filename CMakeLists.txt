@@ -75,6 +75,8 @@ add_library(rosbags_cpp
   src/rosbag1.cpp
   src/sqlite3.cpp
   src/codec.cpp
+  src/codegen.cpp
+  src/profiles.cpp
   src/mcap.cpp
 )
 add_library(rosbags_cpp::rosbags_cpp ALIAS rosbags_cpp)
