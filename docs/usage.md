@@ -38,6 +38,12 @@ cmake -S . -B build-no-mcap \
 cmake --build build-no-mcap -j2
 ```
 
+工程 C++ 测试使用 vendored 的 doctest v2.5.3 single-header，不链接额外测试库。
+
+```bash
+build-no-mcap/rosbags_cpp_tests
+```
+
 使用已有 MCAP SDK 时，前缀需要包含 `include/mcap_vendor/mcap/reader.hpp` 和 `lib/libmcap.so`：
 
 ```bash

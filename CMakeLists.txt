@@ -118,10 +118,14 @@ if(ROSBAGS_BUILD_TOOLS)
 endif()
 
 if(ROSBAGS_BUILD_TESTS)
-  add_executable(rosbags_cpp_tests tests/test_main.cpp)
+  # doctest v2.5.3 is vendored as its official single header.  No doctest
+  # library is linked; test_main.cpp provides the header-only implementation.
+  set(ROSBAGS_DOCTEST_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tests/third_party")
+  add_executable(rosbags_cpp_tests tests/test_main.cpp tests/test_project.cpp)
+  target_include_directories(rosbags_cpp_tests PRIVATE "${ROSBAGS_DOCTEST_INCLUDE_DIR}")
   target_link_libraries(rosbags_cpp_tests PRIVATE rosbags_cpp)
   target_compile_options(rosbags_cpp_tests PRIVATE -Wall -Wextra -Wpedantic)
-  add_test(NAME rosbags_cpp_tests COMMAND rosbags_cpp_tests)
+  add_test(NAME rosbags_cpp_project_tests COMMAND rosbags_cpp_tests)
 endif()
 
 install(TARGETS rosbags_cpp EXPORT rosbags_cppTargets
