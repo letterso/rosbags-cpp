@@ -1,25 +1,22 @@
 # rosbags-cpp
 
-[中文文档](README_CN.md)
+`rosbags-cpp` 是一个只读 C++17 bag 读取库，支持 ROS1 bag v2.0、ROS2
+SQLite3、ROS2 bag 目录和 MCAP。库不初始化 ROS 运行时，也不依赖
+`rclcpp`、`rosbag` 或 `rosbag2`，可以嵌入普通 CMake/C++ 应用。
 
-`rosbags-cpp` is a read-only C++17 reader for ROS1 bag v2.0, ROS2 SQLite3,
-ROS2 bag directories, and MCAP. It does not initialize or depend on a ROS
-runtime, so it can be embedded in a plain CMake/C++ application.
+MCAP 默认启用；构建时可以使用已有 SDK，也可以自动下载并编译
+`mcap_builder`，还可以关闭 MCAP 进行离线构建。
 
-MCAP support is enabled by default. The build can use an installed SDK or
-fetch and build `mcap_builder`; it can also be disabled for an offline build.
-
-## Documentation
+## 文档
 
 - [落盘方案与程序架构](docs/architecture.md)
 - [具体使用文档：CLI、C++ API 和自定义消息](docs/usage.md)
 - [消息定义输入说明](definitions/README.md)
 
-## Quick build
+## 快速构建
 
-Required dependencies are SQLite3, yaml-cpp, liblz4, libzstd, and pkg-config.
-See the [usage document](docs/usage.md) for CMake versions, optional BZip2,
-MCAP configuration, installation, and downstream integration.
+基础依赖为 SQLite3、yaml-cpp、liblz4、libzstd 和 pkg-config。CMake
+版本、BZip2/MCAP 配置、安装和下游工程接入请参阅[具体使用文档](docs/usage.md)。
 
 ```bash
 cmake -S . -B build -DROSBAGS_BUILD_TESTS=ON
@@ -27,8 +24,7 @@ cmake --build build -j2
 ctest --test-dir build --output-on-failure
 ```
 
-The command-line tools are built under `build/` when
-`ROSBAGS_BUILD_TOOLS=ON`:
+启用 `ROSBAGS_BUILD_TOOLS=ON` 时，命令行工具位于 `build/`：
 
 ```bash
 build/rosbags-info PATH
