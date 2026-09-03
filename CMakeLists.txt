@@ -108,6 +108,15 @@ target_compile_definitions(rosbags_cpp
 )
 target_compile_options(rosbags_cpp PRIVATE -Wall -Wextra -Wpedantic)
 
+if(ROSBAGS_BUILD_TOOLS)
+  add_executable(rosbags-info tools/rosbags_info.cpp)
+  target_link_libraries(rosbags-info PRIVATE rosbags_cpp)
+  add_executable(rosbags-read tools/rosbags_read.cpp)
+  target_link_libraries(rosbags-read PRIVATE rosbags_cpp)
+  add_executable(rosbags-gen tools/rosbags_gen.cpp)
+  target_link_libraries(rosbags-gen PRIVATE rosbags_cpp)
+endif()
+
 install(TARGETS rosbags_cpp EXPORT rosbags_cppTargets
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
