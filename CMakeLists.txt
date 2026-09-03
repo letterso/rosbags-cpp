@@ -117,6 +117,13 @@ if(ROSBAGS_BUILD_TOOLS)
   target_link_libraries(rosbags-gen PRIVATE rosbags_cpp)
 endif()
 
+if(ROSBAGS_BUILD_TESTS)
+  add_executable(rosbags_cpp_tests tests/test_main.cpp)
+  target_link_libraries(rosbags_cpp_tests PRIVATE rosbags_cpp)
+  target_compile_options(rosbags_cpp_tests PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME rosbags_cpp_tests COMMAND rosbags_cpp_tests)
+endif()
+
 install(TARGETS rosbags_cpp EXPORT rosbags_cppTargets
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
