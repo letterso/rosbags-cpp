@@ -65,6 +65,11 @@ std::string namespace_for(const Definition& definition, std::string_view profile
 std::string local_type(const Definition& owner, const std::string& type, std::string_view profile) {
   if (is_primitive(type)) return primitive_cpp(type);
   const auto canonical = canonical_type(owner.package, type);
+  // Header is a ROS common type whose ROS1 wire representation contains the
+  // legacy sequence field while ROS2 CDR does not. Reuse the profile type and
+  // emit the two wire readers below instead of generating one incompatible
+  // struct from a single .msg definition.
+  if (canonical == "std_msgs/msg/Header") return "rosbags::profiles::Header";
   const auto slash = canonical.find("/msg/");
   if (slash == std::string::npos) return "std::string";
   return "rosbags::generated::" + sanitize(std::string(profile)) + "::" + sanitize(canonical.substr(0, slash)) + "::msg::" + sanitize(canonical.substr(slash + 5));
@@ -235,7 +240,12 @@ void generate(const GenerateOptions& options) {
   const auto header_path = output_dir / (sanitize(options.profile) + "_messages.hpp");
   std::ofstream header(header_path);
   if (!header) throw RosbagsError("cannot create generated header: " + header_path.string());
-  header << "#pragma once\n#include <array>\n#include <cstdint>\n#include <memory>\n#include <string>\n#include <utility>\n#include <vector>\n#include <rosbags/serialization.hpp>\n#include <rosbags/rosbags.hpp>\n\n";
+  header << "#pragma once\n#include <array>\n#include <cstdint>\n#include <memory>\n#include <string>\n#include <utility>\n#include <vector>\n#include <rosbags/serialization.hpp>\n#include <rosbags/rosbags.hpp>\n#include <rosbags/profiles.hpp>\n\n";
+  for (const auto& definition : definitions) {
+    header << "namespace " << namespace_for(definition, options.profile) << " { struct "
+           << sanitize(definition.name) << "; }\n";
+  }
+  header << "\n";
   for (const auto& definition : definitions) {
     const auto ns = namespace_for(definition, options.profile);
     header << "namespace " << ns << " {\n";
@@ -245,6 +255,12 @@ void generate(const GenerateOptions& options) {
     header << "}\n";
   }
   header << "\nnamespace rosbags::generated::" << sanitize(options.profile) << "::detail {\nusing namespace rosbags::serialization;\n";
+  header << "inline void read_ros1(Ros1Reader& reader, rosbags::profiles::Header& value) {\n"
+         << "  (void)reader.u32();\n  value.stamp.sec = reader.i32();\n"
+         << "  value.stamp.nanosec = reader.u32();\n  value.frame_id = reader.string();\n}\n";
+  header << "inline void read_cdr(CdrReader& reader, rosbags::profiles::Header& value) {\n"
+         << "  value.stamp.sec = reader.i32();\n  value.stamp.nanosec = reader.u32();\n"
+         << "  value.frame_id = reader.string();\n}\n";
   for (const auto& definition : definitions) {
     const auto qname = namespace_for(definition, options.profile) + "::" + sanitize(definition.name);
     header << "inline void read_ros1(Ros1Reader&, " << qname << "&); inline void read_cdr(CdrReader&, " << qname << "&);\n";
