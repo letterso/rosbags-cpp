@@ -7,7 +7,15 @@ include(CMakePackageConfigHelpers)
 
 option(ROSBAGS_BUILD_TESTS "Build rosbags_cpp tests" ON)
 option(ROSBAGS_BUILD_TOOLS "Build rosbags_cpp command line tools" ON)
+option(ROSBAGS_ENABLE_MCAP "Enable MCAP backend and fetch/build MCAP when unavailable" ON)
 option(ROSBAGS_ENABLE_BZ2 "Build BZ2 support when the development library is available" ON)
+set(ROSBAGS_MCAP_ROOT "" CACHE PATH "Optional prefix containing the official MCAP C++ SDK")
+set(ROSBAGS_MCAP_BUILDER_REPOSITORY "https://github.com/olympus-robotics/mcap_builder.git" CACHE STRING "MCAP CMake builder repository")
+set(ROSBAGS_MCAP_BUILDER_TAG "main" CACHE STRING "MCAP CMake builder git tag, branch, or commit")
+
+if(ROSBAGS_ENABLE_MCAP AND CMAKE_VERSION VERSION_LESS 3.22.1)
+  message(FATAL_ERROR "ROSBAGS_ENABLE_MCAP requires CMake 3.22.1 or newer for the mcap_builder FetchContent workflow")
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,6 +32,41 @@ if(ROSBAGS_ENABLE_BZ2)
   find_package(BZip2 QUIET)
   if(BZIP2_FOUND)
     set(ROSBAGS_HAS_BZ2 ON)
+  endif()
+endif()
+
+set(ROSBAGS_HAS_MCAP OFF)
+set(ROSBAGS_MCAP_EXTERNAL OFF)
+if(ROSBAGS_ENABLE_MCAP)
+  if(ROSBAGS_MCAP_ROOT)
+    find_path(ROSBAGS_MCAP_INCLUDE_DIR NAMES mcap/reader.hpp
+      PATHS "${ROSBAGS_MCAP_ROOT}/include/mcap_vendor" "${ROSBAGS_MCAP_ROOT}/include"
+      NO_DEFAULT_PATH)
+    find_library(ROSBAGS_MCAP_LIBRARY NAMES mcap PATHS "${ROSBAGS_MCAP_ROOT}/lib" NO_DEFAULT_PATH)
+    if(ROSBAGS_MCAP_INCLUDE_DIR AND ROSBAGS_MCAP_LIBRARY)
+      set(ROSBAGS_HAS_MCAP ON)
+      set(ROSBAGS_MCAP_EXTERNAL ON)
+    endif()
+  else()
+    find_package(mcap CONFIG QUIET)
+    if((mcap_FOUND OR MCAP_FOUND) AND (TARGET mcap::mcap OR TARGET mcap))
+      set(ROSBAGS_HAS_MCAP ON)
+    endif()
+  endif()
+  if(NOT ROSBAGS_HAS_MCAP)
+    include(FetchContent)
+    FetchContent_Declare(
+      mcap_builder
+      GIT_REPOSITORY "${ROSBAGS_MCAP_BUILDER_REPOSITORY}"
+      GIT_TAG "${ROSBAGS_MCAP_BUILDER_TAG}"
+      GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(mcap_builder)
+    if(TARGET mcap::mcap OR TARGET mcap)
+      set(ROSBAGS_HAS_MCAP ON)
+    else()
+      message(FATAL_ERROR "MCAP was enabled, but mcap_builder did not provide an mcap target")
+    endif()
   endif()
 endif()
 
@@ -47,9 +90,19 @@ target_link_libraries(rosbags_cpp
 if(ROSBAGS_HAS_BZ2)
   target_link_libraries(rosbags_cpp PUBLIC BZip2::BZip2)
 endif()
+if(ROSBAGS_HAS_MCAP)
+  if(ROSBAGS_MCAP_EXTERNAL)
+    target_include_directories(rosbags_cpp PUBLIC "${ROSBAGS_MCAP_INCLUDE_DIR}")
+    target_link_libraries(rosbags_cpp PUBLIC "${ROSBAGS_MCAP_LIBRARY}")
+  elseif(TARGET mcap::mcap)
+    target_link_libraries(rosbags_cpp PUBLIC mcap::mcap)
+  elseif(TARGET mcap)
+    target_link_libraries(rosbags_cpp PUBLIC mcap)
+  endif()
+endif()
 target_compile_definitions(rosbags_cpp
   PUBLIC ROSBAGS_HAS_BZ2=$<BOOL:${ROSBAGS_HAS_BZ2}>
-         ROSBAGS_HAS_MCAP=0
+         ROSBAGS_HAS_MCAP=$<BOOL:${ROSBAGS_HAS_MCAP}>
 )
 target_compile_options(rosbags_cpp PRIVATE -Wall -Wextra -Wpedantic)
 
@@ -75,4 +128,5 @@ install(FILES
   DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/rosbags_cpp"
 )
 
+message(STATUS "rosbags_cpp MCAP support: ${ROSBAGS_HAS_MCAP}")
 message(STATUS "rosbags_cpp BZ2 support: ${ROSBAGS_HAS_BZ2}")
