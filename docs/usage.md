@@ -386,6 +386,17 @@ int main() {
 
 生成器会同时生成 ROS1 和 CDR 读取函数；因此同一组定义可以分别用于 `ros1_noetic` 或 `ros2_*` profile，但定义字段必须与录包时的 wire layout 一致。
 
+### 5.5 自定义消息的两条路径
+
+| 路径 | 适用类型 | 注册方式 | 取舍 |
+| --- | --- | --- | --- |
+| 生成器路径 | 不属于 ROS 标准发行版的消息，以及项目或设备自定义消息 | 用 `rosbags-gen` 生成 `<profile>_messages.hpp` 和 `<profile>_registry.hpp`，调用生成的 `register_types()` | 不修改库内置 profile；定义和 wire layout 随应用版本管理，可同时生成 ROS1/CDR decoder |
+| 内置 profile 路径 | 需要长期作为库公共 API 的稳定 ROS 标准消息；把自定义消息手写进库也属于此路径 | 在 `profiles.hpp/.cpp` 增加结构体、ROS1/CDR decoder 和 `register_builtin_types()` 注册 | 使用方便，但会扩大库的固定 API 和维护面，不能覆盖任意包名或设备私有定义 |
+
+建议：凡是非 ROS 标准消息类型，统一走生成器路径。只有在消息属于稳定的
+ROS 标准接口、且希望作为所有应用的通用依赖时，才考虑扩展内置 profile；不要为
+单个 bag 或设备把自定义类型硬编码进 profile。
+
 ## 6. 错误处理和排查
 
 | 现象 | 优先检查 |
