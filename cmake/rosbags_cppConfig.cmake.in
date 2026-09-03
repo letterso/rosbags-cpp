@@ -1,0 +1,16 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(SQLite3)
+find_dependency(yaml-cpp)
+find_dependency(PkgConfig)
+pkg_check_modules(LZ4 REQUIRED IMPORTED_TARGET liblz4)
+pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
+if(@ROSBAGS_HAS_BZ2@)
+  find_dependency(BZip2)
+endif()
+if(@ROSBAGS_HAS_MCAP@ AND NOT @ROSBAGS_MCAP_EXTERNAL@)
+  find_dependency(mcap CONFIG)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/rosbags_cppTargets.cmake")
