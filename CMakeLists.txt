@@ -92,7 +92,7 @@ if(ROSBAGS_ENABLE_MCAP)
   endif()
 endif()
 
-add_library(rosbags_cpp
+set(ROSBAGS_CPP_SOURCES
   src/rosbags.cpp
   src/rosbag1.cpp
   src/sqlite3.cpp
@@ -101,6 +101,7 @@ add_library(rosbags_cpp
   src/profiles.cpp
   src/mcap.cpp
 )
+add_library(rosbags_cpp ${ROSBAGS_CPP_SOURCES})
 add_library(rosbags_cpp::rosbags_cpp ALIAS rosbags_cpp)
 
 target_include_directories(rosbags_cpp
@@ -138,6 +139,8 @@ if(ROSBAGS_BUILD_TOOLS)
   add_executable(rosbags-gen tools/rosbags_gen.cpp)
   target_link_libraries(rosbags-gen PRIVATE rosbags_cpp)
 endif()
+
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Cppcheck.cmake")
 
 if(ROSBAGS_BUILD_TESTS)
   # doctest v2.5.3 is vendored as its official single header.  No doctest

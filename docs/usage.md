@@ -65,7 +65,28 @@ cmake -S . -B build-mcap \
 `LZ4::lz4` 与 `zstd::libzstd` 并链接到 `PkgConfig::LZ4`、
 `PkgConfig::ZSTD`；无需向系统安装额外的 CMake 包文件。
 
-### 1.3 安装和下游工程
+### 1.3 Cppcheck 静态检测
+
+> 建议https://github.com/cppcheck-opensource/cppcheck安装新的release版本，避免针对现代C++标准进行检查时出现问题
+
+本工程静态检测不使用系统默认的`/usr/bin/cppcheck`（版本较低，出现误检或者漏检），固定使用 `/usr/local/bin/cppcheck`，不会回退到系统默认的`/usr/bin/cppcheck` 或 `PATH` 中的其他版本。启用前确认该文件存在且可执行：
+
+```bash
+test -x /usr/local/bin/cppcheck
+```
+
+之后启用 `ROSBAGS_ENABLE_CPPCHECK` 并运行专用目标：
+
+```bash
+cmake -S . -B build_cppcheck \
+  -DROSBAGS_ENABLE_CPPCHECK=ON \
+  -DROSBAGS_ENABLE_MCAP=OFF
+cmake --build build_cppcheck --target rosbags_cpp_cppcheck
+```
+
+该目标只将本工程的库和 CLI 生产实现（`src/*.cpp`、`tools/*.cpp`）传给cppcheck；不会扫描 `tests/`、`tests/third_party/`、`rosbags/` Python 子仓库、构建目录或 FetchContent 的 MCAP 源码。检查包含 warning 级规则，发现问题时目标以非零状态退出。
+
+### 1.4 安装和下游工程
 
 ```bash
 cmake --install build --prefix /opt/rosbags_cpp
