@@ -112,63 +112,10 @@ class SqliteBackend final : public Backend {
   StorageKind kind() const override { ensure_open(); return StorageKind::Sqlite3; }
   const ReaderMetadata& metadata() const override { ensure_open(); return metadata_; }
   const std::vector<Connection>& connections() const override { ensure_open(); return connections_; }
-
-  void read_raw(const ReadFilter& filter, const MessageCallback& callback) const override {
-    ensure_open();
-    std::string sql = "SELECT topics.id,messages.timestamp,messages.data FROM messages JOIN topics ON messages.topic_id=topics.id";
-    std::vector<std::uint32_t> topic_ids;
-    for (const auto& connection : connections_) if (has_topic(connection, filter)) topic_ids.push_back(connection.id);
-    if (!filter.topics.empty() || !filter.connection_ids.empty()) {
-      if (topic_ids.empty()) return;
-      sql += " WHERE topics.id IN (";
-      for (std::size_t i = 0; i < topic_ids.size(); ++i) sql += (i ? ",?" : "?");
-      sql += ")";
-    }
-    if (filter.start) sql += (sql.find(" WHERE ") == std::string::npos ? " WHERE" : " AND") + std::string(" messages.timestamp >= ?");
-    if (filter.stop) sql += (sql.find(" WHERE ") == std::string::npos ? " WHERE" : " AND") + std::string(" messages.timestamp < ?");
-    sql += " ORDER BY messages.timestamp,messages.id";
-
-    sqlite3_stmt* statement = nullptr;
-    if (sqlite3_prepare_v2(database_.value, sql.c_str(), -1, &statement, nullptr) != SQLITE_OK)
-      throw RosbagsError(sqlite_error(database_.value, "cannot prepare SQLite message query"));
-    SqliteStatement statement_guard{statement};
-    const auto finalize = [&] { statement_guard.reset(); statement = nullptr; };
-    int parameter = 1;
-    for (const auto id : topic_ids) sqlite3_bind_int64(statement, parameter++, static_cast<sqlite3_int64>(id));
-    if (filter.start) sqlite3_bind_int64(statement, parameter++, static_cast<sqlite3_int64>(*filter.start));
-    if (filter.stop) sqlite3_bind_int64(statement, parameter++, static_cast<sqlite3_int64>(*filter.stop));
-    for (;;) {
-      const auto result = sqlite3_step(statement);
-      if (result == SQLITE_DONE) break;
-      if (result != SQLITE_ROW) {
-        finalize();
-        throw RosbagsError(sqlite_error(database_.value, "SQLite message query failed"));
-      }
-      const auto id = static_cast<std::uint32_t>(sqlite3_column_int64(statement, 0));
-      const auto timestamp = sqlite3_column_int64(statement, 1);
-      if (timestamp < 0) {
-        finalize();
-        throw FormatError("negative SQLite timestamp cannot be represented by uint64_t");
-      }
-      const auto* connection = find_connection(id);
-      if (!connection) {
-        finalize();
-        throw FormatError("message references unknown SQLite topic id");
-      }
-      const auto* data = static_cast<const Byte*>(sqlite3_column_blob(statement, 2));
-      const auto size = sqlite3_column_bytes(statement, 2);
-      if (size < 0 || (size != 0 && !data)) {
-        finalize();
-        throw FormatError("invalid SQLite message blob");
-      }
-      auto bytes = std::make_shared<Bytes>();
-      if (size) bytes->assign(data, data + size);
-      callback(Message{std::move(bytes), static_cast<std::uint64_t>(timestamp), connection});
-    }
-    finalize();
-  }
+  std::unique_ptr<BackendCursor> make_cursor(const ReadFilter& filter) const override;
 
  private:
+  class Cursor;
   bool has_table(const char* name) const {
     sqlite3_stmt* statement = nullptr;
     const char* sql = "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?";
@@ -298,6 +245,63 @@ class SqliteBackend final : public Backend {
   bool open_ = false;
 };
 
+class SqliteBackend::Cursor final : public BackendCursor {
+ public:
+  Cursor(const SqliteBackend& owner, const ReadFilter& filter) : owner_(owner) {
+    owner_.ensure_open();
+    std::string sql = "SELECT topics.id,messages.timestamp,messages.data FROM messages JOIN topics ON messages.topic_id=topics.id";
+    std::vector<std::uint32_t> topic_ids;
+    for (const auto& connection : owner_.connections_)
+      if (has_topic(connection, filter)) topic_ids.push_back(connection.id);
+    if (!filter.topics.empty() || !filter.connection_ids.empty()) {
+      if (topic_ids.empty()) return;
+      sql += " WHERE topics.id IN (";
+      for (std::size_t index = 0; index < topic_ids.size(); ++index) sql += index ? ",?" : "?";
+      sql += ")";
+    }
+    if (filter.start) sql += (sql.find(" WHERE ") == std::string::npos ? " WHERE" : " AND") + std::string(" messages.timestamp >= ?");
+    if (filter.stop) sql += (sql.find(" WHERE ") == std::string::npos ? " WHERE" : " AND") + std::string(" messages.timestamp < ?");
+    sql += " ORDER BY messages.timestamp,messages.id";
+    if (sqlite3_prepare_v2(owner_.database_.value, sql.c_str(), -1, &statement_.value, nullptr) != SQLITE_OK)
+      throw RosbagsError(sqlite_error(owner_.database_.value, "cannot prepare SQLite message query"));
+    int parameter = 1;
+    for (const auto id : topic_ids) sqlite3_bind_int64(statement_.value, parameter++, static_cast<sqlite3_int64>(id));
+    if (filter.start) sqlite3_bind_int64(statement_.value, parameter++, static_cast<sqlite3_int64>(*filter.start));
+    if (filter.stop) sqlite3_bind_int64(statement_.value, parameter++, static_cast<sqlite3_int64>(*filter.stop));
+  }
+
+  bool next(Message& output) override {
+    owner_.ensure_open();
+    if (!statement_.value) return false;
+    const auto result = sqlite3_step(statement_.value);
+    if (result == SQLITE_DONE) {
+      statement_.reset();
+      return false;
+    }
+    if (result != SQLITE_ROW) throw RosbagsError(sqlite_error(owner_.database_.value, "SQLite message query failed"));
+    const auto id = static_cast<std::uint32_t>(sqlite3_column_int64(statement_.value, 0));
+    const auto timestamp = sqlite3_column_int64(statement_.value, 1);
+    if (timestamp < 0) throw FormatError("negative SQLite timestamp cannot be represented by uint64_t");
+    const auto* connection = owner_.find_connection(id);
+    if (!connection) throw FormatError("message references unknown SQLite topic id");
+    const auto* data = static_cast<const Byte*>(sqlite3_column_blob(statement_.value, 2));
+    const auto size = sqlite3_column_bytes(statement_.value, 2);
+    if (size < 0 || (size != 0 && !data)) throw FormatError("invalid SQLite message blob");
+    auto bytes = std::make_shared<Bytes>();
+    if (size) bytes->assign(data, data + size);
+    output = Message{std::move(bytes), static_cast<std::uint64_t>(timestamp), connection};
+    return true;
+  }
+
+ private:
+  const SqliteBackend& owner_;
+  SqliteStatement statement_;
+};
+
+std::unique_ptr<BackendCursor> SqliteBackend::make_cursor(const ReadFilter& filter) const {
+  return std::make_unique<Cursor>(*this, filter);
+}
+
 class DirectoryBackend final : public Backend {
  public:
   explicit DirectoryBackend(std::string path) : path_(std::move(path)) {}
@@ -411,25 +415,10 @@ class DirectoryBackend final : public Backend {
   StorageKind kind() const override { ensure_open(); return metadata_.storage; }
   const ReaderMetadata& metadata() const override { ensure_open(); return metadata_; }
   const std::vector<Connection>& connections() const override { ensure_open(); return connections_; }
-  void read_raw(const ReadFilter& filter, const MessageCallback& callback) const override {
-    ensure_open();
-    for (const auto& backend : backends_) {
-      ReadFilter local_filter = filter;
-      local_filter.connection_ids.clear();
-      backend->read_raw(local_filter, [&](const Message& message) {
-        const auto it = std::find_if(connections_.begin(), connections_.end(), [&](const auto& connection) {
-          return connection.topic == message.connection->topic && connection.type == message.connection->type;
-        });
-        if (it == connections_.end()) return;
-        if (!has_topic(*it, filter) || !in_time(message.timestamp, filter)) return;
-        auto bytes = message.bytes;
-        if (compression_mode_ == "message") bytes = std::make_shared<Bytes>(zstd_bytes(ByteView{bytes->data(), bytes->size()}));
-        callback(Message{std::move(bytes), message.timestamp, &*it});
-      });
-    }
-  }
+  std::unique_ptr<BackendCursor> make_cursor(const ReadFilter& filter) const override;
 
  private:
+  class Cursor;
   void close_impl() noexcept {
     for (auto it = backends_.rbegin(); it != backends_.rend(); ++it) (*it)->close();
     backends_.clear();
@@ -487,6 +476,88 @@ class DirectoryBackend final : public Backend {
   std::string compression_mode_;
   bool open_ = false;
 };
+
+class DirectoryBackend::Cursor final : public BackendCursor {
+ public:
+  Cursor(const DirectoryBackend& owner, const ReadFilter& filter) : owner_(owner), filter_(filter) {
+    owner_.ensure_open();
+    for (const auto& backend : owner_.backends_) {
+      ReadFilter local = filter;
+      local.connection_ids.clear();
+      sources_.push_back({backend->make_cursor(local), std::nullopt});
+    }
+    for (std::size_t index = 0; index < sources_.size(); ++index) pull(index);
+  }
+
+  bool next(Message& output) override {
+    owner_.ensure_open();
+    if (pending_source_) {
+      pull(*pending_source_);
+      pending_source_.reset();
+    }
+    if (heap_.empty()) return false;
+    const auto item = heap_.top();
+    heap_.pop();
+    auto& source = sources_[item.source];
+    auto message = std::move(*source.head);
+    source.head.reset();
+    const auto* connection = map_connection(message.connection);
+    if (!connection) throw FormatError("message references unknown ROS2 directory topic");
+    if (owner_.compression_mode_ == "message") {
+      message.bytes = std::make_shared<Bytes>(zstd_bytes(ByteView{message.bytes->data(), message.bytes->size()}));
+    }
+    message.connection = connection;
+    output = std::move(message);
+    pending_source_ = item.source;
+    return true;
+  }
+
+ private:
+  struct Source {
+    std::unique_ptr<BackendCursor> cursor;
+    std::optional<Message> head;
+  };
+  struct HeapItem {
+    std::uint64_t timestamp = 0;
+    std::size_t source = 0;
+  };
+  struct HeapCompare {
+    bool operator()(const HeapItem& left, const HeapItem& right) const {
+      if (left.timestamp != right.timestamp) return left.timestamp > right.timestamp;
+      return left.source > right.source;
+    }
+  };
+
+  const Connection* map_connection(const Connection* child) const {
+    if (!child) return nullptr;
+    const auto it = std::find_if(owner_.connections_.begin(), owner_.connections_.end(), [&](const auto& connection) {
+      return connection.topic == child->topic && connection.type == child->type;
+    });
+    return it == owner_.connections_.end() ? nullptr : &*it;
+  }
+
+  void pull(std::size_t source_index) {
+    auto& source = sources_[source_index];
+    Message message;
+    while (source.cursor->next(message)) {
+      const auto* connection = map_connection(message.connection);
+      if (!connection || !has_topic(*connection, filter_) || !in_time(message.timestamp, filter_)) continue;
+      source.head = std::move(message);
+      heap_.push({source.head->timestamp, source_index});
+      return;
+    }
+  }
+
+  const DirectoryBackend& owner_;
+  ReadFilter filter_;
+  std::vector<Source> sources_;
+  std::priority_queue<HeapItem, std::vector<HeapItem>, HeapCompare> heap_;
+  std::optional<std::size_t> pending_source_;
+};
+
+std::unique_ptr<BackendCursor> DirectoryBackend::make_cursor(const ReadFilter& filter) const {
+  return std::make_unique<Cursor>(*this, filter);
+}
 
 }  // namespace
 

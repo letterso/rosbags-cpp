@@ -5,8 +5,10 @@
 #include <rosbags/codegen.hpp>
 
 #include <sqlite3.h>
+#include <lz4frame.h>
 #include <zstd.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -68,6 +70,93 @@ std::filesystem::path temp_path(const std::string& suffix) {
   return std::filesystem::temp_directory_path() / ("rosbags_cpp_test_" + std::to_string(++counter) + suffix);
 }
 
+struct Ros1TestMessage {
+  std::uint64_t timestamp;
+  Bytes payload;
+};
+
+void write_ros1_bag(const std::filesystem::path& path,
+                    const std::vector<std::vector<Ros1TestMessage>>& message_chunks,
+                    bool use_lz4 = false) {
+  struct ChunkData {
+    Bytes bytes;
+    std::uint64_t start = 0;
+    std::uint64_t end = 0;
+  };
+  std::vector<ChunkData> chunks;
+  for (const auto& messages : message_chunks) {
+    REQUIRE_FALSE(messages.empty());
+    Bytes payload;
+    Bytes index_body;
+    auto start = messages.front().timestamp;
+    auto end = messages.front().timestamp;
+    for (const auto& item : messages) {
+      const auto offset = static_cast<std::uint32_t>(payload.size());
+      const auto sec = static_cast<std::uint32_t>(item.timestamp / 1000000000ULL);
+      const auto nsec = static_cast<std::uint32_t>(item.timestamp % 1000000000ULL);
+      const auto message = record({{"op", u8(2)}, {"conn", u32(0)}, {"time", time_value(sec, nsec)}}, item.payload);
+      payload.insert(payload.end(), message.begin(), message.end());
+      put32(index_body, sec);
+      put32(index_body, nsec);
+      put32(index_body, offset);
+      start = std::min(start, item.timestamp);
+      end = std::max(end, item.timestamp);
+    }
+    auto chunk_payload = payload;
+    Bytes compression{'n','o','n','e'};
+    if (use_lz4) {
+      chunk_payload.resize(LZ4F_compressFrameBound(payload.size(), nullptr));
+      const auto compressed_size = LZ4F_compressFrame(
+          chunk_payload.data(), chunk_payload.size(), payload.data(), payload.size(), nullptr);
+      REQUIRE_FALSE(LZ4F_isError(compressed_size));
+      chunk_payload.resize(compressed_size);
+      compression = Bytes{'l','z','4'};
+    }
+    auto bytes = record({{"op", u8(5)}, {"compression", compression},
+                         {"size", u32(static_cast<std::uint32_t>(payload.size()))}}, chunk_payload);
+    const auto index = record({{"op", u8(4)}, {"ver", u32(1)}, {"conn", u32(0)},
+                               {"count", u32(static_cast<std::uint32_t>(messages.size()))}}, index_body);
+    bytes.insert(bytes.end(), index.begin(), index.end());
+    chunks.push_back({std::move(bytes), start, end});
+  }
+  std::vector<std::uint64_t> positions;
+  std::uint64_t position = 13 + 4096;
+  for (const auto& chunk : chunks) {
+    positions.push_back(position);
+    position += chunk.bytes.size();
+  }
+  const auto index_position = position;
+  const auto connection_data = serialized_fields({{"type", Bytes{'t','e','s','t','/','M'}},
+                                                   {"md5sum", Bytes{'x'}},
+                                                   {"message_definition", Bytes{'i','n','t','3','2',' ','v'}}});
+  const auto connection = record({{"op", u8(7)}, {"conn", u32(0)}, {"topic", Bytes{'/','c'}}}, connection_data);
+  Bytes index_section = connection;
+  for (std::size_t index = 0; index < chunks.size(); ++index) {
+    const auto start_sec = static_cast<std::uint32_t>(chunks[index].start / 1000000000ULL);
+    const auto start_nsec = static_cast<std::uint32_t>(chunks[index].start % 1000000000ULL);
+    const auto end_sec = static_cast<std::uint32_t>(chunks[index].end / 1000000000ULL);
+    const auto end_nsec = static_cast<std::uint32_t>(chunks[index].end % 1000000000ULL);
+    Bytes counts;
+    put32(counts, 0);
+    put32(counts, static_cast<std::uint32_t>(message_chunks[index].size()));
+    const auto info = record({{"op", u8(6)}, {"ver", u32(1)}, {"chunk_pos", u64(positions[index])},
+                              {"start_time", time_value(start_sec, start_nsec)},
+                              {"end_time", time_value(end_sec, end_nsec)}, {"count", u32(1)}}, counts);
+    index_section.insert(index_section.end(), info.begin(), info.end());
+  }
+  auto bag_header = header({{"op", u8(3)}, {"index_pos", u64(index_position)}, {"conn_count", u32(1)},
+                            {"chunk_count", u32(static_cast<std::uint32_t>(chunks.size()))}});
+  const auto padding = static_cast<std::uint32_t>(4096 - 4 - bag_header.size());
+  put32(bag_header, padding);
+  bag_header.resize(4096, 0x20);
+  std::ofstream output(path, std::ios::binary);
+  output << "#ROSBAG V2.0\n";
+  output.write(reinterpret_cast<const char*>(bag_header.data()), static_cast<std::streamsize>(bag_header.size()));
+  for (const auto& chunk : chunks)
+    output.write(reinterpret_cast<const char*>(chunk.bytes.data()), static_cast<std::streamsize>(chunk.bytes.size()));
+  output.write(reinterpret_cast<const char*>(index_section.data()), static_cast<std::streamsize>(index_section.size()));
+}
+
 TEST_CASE("reads SQLite bags in timestamp order" * doctest::test_suite("project")) {
   const auto path = temp_path(".dbs");
   sqlite3* database = nullptr;
@@ -93,7 +182,30 @@ TEST_CASE("reads SQLite bags in timestamp order" * doctest::test_suite("project"
   std::vector<std::uint64_t> timestamps;
   reader.read_raw({}, [&](const rosbags::Message& message) { timestamps.push_back(message.timestamp); });
   CHECK((timestamps == std::vector<std::uint64_t>{10, 20}));
+  {
+    auto cursor = reader.messages();
+    rosbags::Reader replacement(path.string());
+    replacement.open();
+    reader = std::move(replacement);
+    CHECK(reader.is_open());
+    rosbags::Message message;
+    std::vector<std::uint64_t> cursor_timestamps;
+    while (cursor.next(message)) cursor_timestamps.push_back(message.timestamp);
+    CHECK(cursor_timestamps == timestamps);
+  }
   reader.close();
+
+  std::optional<rosbags::MessageCursor> detached;
+  {
+    rosbags::Reader scoped(path.string());
+    scoped.open();
+    detached.emplace(scoped.messages());
+  }
+  rosbags::Message detached_message;
+  std::vector<std::uint64_t> detached_timestamps;
+  while (detached->next(detached_message)) detached_timestamps.push_back(detached_message.timestamp);
+  CHECK(detached_timestamps == timestamps);
+  detached.reset();
   std::filesystem::remove(path);
 }
 
@@ -283,6 +395,123 @@ TEST_CASE("reads ROS1 bag chunks and indexes" * doctest::test_suite("project")) 
     ++count;
   });
   CHECK(count == 1);
+  reader.close();
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("AnyReader merges cursor heads in stable timestamp order" * doctest::test_suite("project")) {
+  const auto first = temp_path("_first.db3");
+  const auto second = temp_path("_second.db3");
+  const auto write_sqlite = [](const std::filesystem::path& path, const char* topic, const char* rows) {
+    sqlite3* database = nullptr;
+    REQUIRE(sqlite3_open(path.c_str(), &database) == SQLITE_OK);
+    const std::string schema =
+        "CREATE TABLE schema(schema_version INTEGER PRIMARY KEY, ros_distro TEXT NOT NULL);"
+        "INSERT INTO schema VALUES(4,'test');"
+        "CREATE TABLE topics(id INTEGER PRIMARY KEY,name TEXT NOT NULL,type TEXT NOT NULL,serialization_format TEXT NOT NULL,offered_qos_profiles TEXT NOT NULL,type_description_hash TEXT NOT NULL);"
+        "CREATE TABLE message_definitions(id INTEGER PRIMARY KEY,topic_type TEXT NOT NULL,encoding TEXT NOT NULL,encoded_message_definition TEXT NOT NULL,type_description_hash TEXT NOT NULL);"
+        "CREATE TABLE messages(id INTEGER PRIMARY KEY,topic_id INTEGER NOT NULL,timestamp INTEGER NOT NULL,data BLOB NOT NULL);"
+        "INSERT INTO topics VALUES(1,'" + std::string(topic) + "','test_msgs/msg/Numbers','cdr','','');"
+        "INSERT INTO message_definitions VALUES(1,'test_msgs/msg/Numbers','ros2msg','int32 value','');" + rows;
+    REQUIRE(sqlite3_exec(database, schema.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(database);
+  };
+  write_sqlite(first, "/first", "INSERT INTO messages VALUES(1,1,20,X'01');INSERT INTO messages VALUES(2,1,10,X'02');");
+  write_sqlite(second, "/second", "INSERT INTO messages VALUES(1,1,15,X'03');INSERT INTO messages VALUES(2,1,10,X'04');");
+
+  rosbags::AnyReader reader({first.string(), second.string()});
+  reader.open();
+  {
+    auto cursor = reader.messages();
+    auto moved = std::move(reader);
+    CHECK_FALSE(reader.is_open());
+    rosbags::Message message;
+    std::vector<std::string> observed;
+    while (cursor.next(message)) observed.push_back(std::to_string(message.timestamp) + message.connection->topic);
+    CHECK((observed == std::vector<std::string>{"10/first", "10/second", "15/second", "20/first"}));
+    reader = std::move(moved);
+    CHECK(reader.is_open());
+  }
+  {
+    rosbags::ReadFilter filter;
+    filter.connection_ids = {2};
+    auto cursor = reader.messages(filter);
+    rosbags::Message message;
+    REQUIRE(cursor.next(message));
+    CHECK(message.connection->topic == "/second");
+    CHECK(message.timestamp == 10);
+    REQUIRE(cursor.next(message));
+    CHECK(message.connection->topic == "/second");
+    CHECK(message.timestamp == 15);
+    CHECK_FALSE(cursor.next(message));
+  }
+  reader.close();
+
+  std::optional<rosbags::MessageCursor> detached;
+  {
+    rosbags::AnyReader scoped({first.string(), second.string()});
+    scoped.open();
+    detached.emplace(scoped.messages());
+  }
+  rosbags::Message detached_message;
+  std::size_t detached_count = 0;
+  while (detached->next(detached_message)) {
+    CHECK(detached_message.connection != nullptr);
+    ++detached_count;
+  }
+  CHECK(detached_count == 4);
+  detached.reset();
+
+  std::filesystem::remove(first);
+  std::filesystem::remove(second);
+}
+
+TEST_CASE("ROS1 cursor limits one chunk without limiting the whole bag" * doctest::test_suite("project")) {
+  const auto oversized = temp_path("_oversized.bag");
+  write_ros1_bag(oversized, {{{1000000001ULL, Bytes(96, 0x31)}}});
+  rosbags::ReaderOptions strict;
+  strict.max_rosbag1_chunk_bytes = 64;
+  rosbags::Reader limited(oversized.string(), strict);
+  limited.open();
+  CHECK_THROWS_AS(limited.read_raw({}, [](const rosbags::Message&) {}), rosbags::ResourceLimitError);
+  limited.close();
+  std::filesystem::remove(oversized);
+
+  const auto multi_chunk = temp_path("_multi_chunk.bag");
+  write_ros1_bag(multi_chunk, {
+      {{1000000001ULL, Bytes(12, 0x11)}},
+      {{1000000002ULL, Bytes(12, 0x22)}},
+      {{1000000003ULL, Bytes(12, 0x33)}},
+  });
+  rosbags::ReaderOptions per_chunk;
+  per_chunk.max_rosbag1_chunk_bytes = 128;
+  rosbags::Reader reader(multi_chunk.string(), per_chunk);
+  reader.open();
+  std::size_t count = 0;
+  reader.read_raw({}, [&](const rosbags::Message& message) {
+    CHECK(message.bytes->size() == 12);
+    ++count;
+  });
+  CHECK(count == 3);
+  reader.close();
+  std::filesystem::remove(multi_chunk);
+}
+
+TEST_CASE("ROS1 cursor streams LZ4 chunks" * doctest::test_suite("project")) {
+  const auto path = temp_path("_lz4.bag");
+  const Bytes payload(96, 0x4a);
+  write_ros1_bag(path, {{{1000000001ULL, payload}, {1000000002ULL, payload},
+                         {1000000003ULL, payload}}}, true);
+  rosbags::ReaderOptions options;
+  options.max_rosbag1_chunk_bytes = 512;
+  rosbags::AnyReader reader({path.string()}, options);
+  reader.open();
+  std::size_t count = 0;
+  reader.read_raw({}, [&](const rosbags::Message& message) {
+    CHECK(*message.bytes == payload);
+    ++count;
+  });
+  CHECK(count == 3);
   reader.close();
   std::filesystem::remove(path);
 }

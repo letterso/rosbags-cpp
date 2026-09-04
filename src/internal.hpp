@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <queue>
 #include <sstream>
 #include <type_traits>
 #include <yaml-cpp/yaml.h>
@@ -125,6 +126,12 @@ inline bool in_time(std::uint64_t time, const ReadFilter& filter) {
   return (!filter.start || time >= *filter.start) && (!filter.stop || time < *filter.stop);
 }
 
+class BackendCursor {
+ public:
+  virtual ~BackendCursor() = default;
+  virtual bool next(Message& output) = 0;
+};
+
 struct Backend {
   virtual ~Backend() = default;
   virtual void open() = 0;
@@ -133,10 +140,15 @@ struct Backend {
   virtual StorageKind kind() const = 0;
   virtual const ReaderMetadata& metadata() const = 0;
   virtual const std::vector<Connection>& connections() const = 0;
-  virtual void read_raw(const ReadFilter&, const MessageCallback&) const = 0;
+  virtual std::unique_ptr<BackendCursor> make_cursor(const ReadFilter&) const = 0;
+  void read_raw(const ReadFilter& filter, const MessageCallback& callback) const {
+    auto cursor = make_cursor(filter);
+    Message message;
+    while (cursor->next(message)) callback(message);
+  }
 };
 
-std::unique_ptr<Backend> make_rosbag1_backend(const std::string& path);
+std::unique_ptr<Backend> make_rosbag1_backend(const std::string& path, ReaderOptions options);
 std::unique_ptr<Backend> make_sqlite_backend(const std::string& path);
 std::unique_ptr<Backend> make_directory_backend(const std::string& path);
 std::unique_ptr<Backend> make_mcap_backend(const std::string& path);

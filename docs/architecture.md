@@ -89,16 +89,16 @@ flowchart TD
 ### 5.1 `Reader`
 
 1. 构造函数检查路径存在，并按目录、`.bag`、`.mcap` 或其他后缀选择后端。
-2. `open()` 读取索引/元数据和连接信息，成功后才能访问 `metadata()`、`connections()` 和 `read_raw()`。
-3. `read_raw()` 将后端消息交给回调；单文件后端按自身索引/日志顺序读取，后端负责将消息连接映射到稳定的 `Connection` 地址。`AnyReader` 负责跨输入全局排序，ROS2 目录后端按 metadata 文件顺序依次读取子文件。
+2. `open()` 读取索引/元数据和连接信息，成功后才能访问 `metadata()`、`connections()`、`messages()` 和 `read_raw()`。
+3. 每个 backend 创建增量 cursor；SQLite 使用有序 prepared statement，ROS1 合并 per-connection 索引，MCAP 使用 log-time order，目录后端合并子 storage cursor。`read_raw()` 只负责排空 cursor。
 4. `read_decoded()` 复用 `read_raw()`，对每条消息调用 `decode()`。
-5. `close()` 是幂等的，并释放 SQLite 句柄、MCAP reader、解压缓存和目录临时文件。
+5. reader 外壳和 cursor 共享内部状态，因此移动或销毁外壳不会使 cursor 失效；`close()` 是幂等的，并释放 SQLite 句柄、MCAP reader、解压缓存和目录临时文件，显式调用前必须先销毁活跃 cursor。
 
-后端在 `open()` 失败时清理已创建的子资源。格式错误使用 `FormatError`，缺少可选能力使用 `UnsupportedFeature`，类型或 payload 解码失败使用 `DecodeError`，普通 I/O/API 状态使用 `RosbagsError`。
+后端在 `open()` 失败时清理已创建的子资源。格式错误使用 `FormatError`，资源上限使用 `ResourceLimitError`，缺少可选能力使用 `UnsupportedFeature`，类型或 payload 解码失败使用 `DecodeError`，普通 I/O/API 状态使用 `RosbagsError`。
 
 ### 5.2 `AnyReader`
 
-`AnyReader` 先打开所有子 `Reader`，拒绝混合 ROS1 与 ROS2。它为每个子 reader 重新分配全局连接 ID，收集所有消息后稳定排序，再按过滤器回调。这个实现保证跨文件时间顺序，但会把选中的消息暂存在内存中，适合有限数量的分片输入，不适合作为无限流处理器。
+`AnyReader` 先打开所有子 `Reader`，拒绝混合 ROS1 与 ROS2，并为每个子 reader 重新分配全局连接 ID。它维护一个以 `(timestamp, 输入顺序)` 排序的最小堆，每次只保留每个输入的一条当前消息；同时间戳仍按输入顺序和子 reader 的稳定顺序输出。它不再收集或排序全量 payload。外壳和 cursor 共享内部状态，所以移动或销毁外壳不会留下悬空引用；显式 `close()` 前仍必须销毁共享该状态的 cursor。
 
 ## 6. 各存储后端
 
@@ -109,11 +109,11 @@ flowchart TD
 1. 校验 `#ROSBAG V2.0` magic。
 2. 读取带长度前缀的 bag header，取得 `index_pos`、连接数和 chunk 数。
 3. 从 `index_pos` 读取 connection header；connection 数据体是字段序列本身，不再包含一层 header 长度。
-4. 读取每个 `CHUNK_INFO`，建立 chunk 位置、时间范围、连接计数。
-5. 按 chunk 读取 `CHUNK` 和 `IDXDATA`，索引项保存时间戳、chunk 位置和消息偏移。
-6. 读取时按索引时间排序，按需解压 chunk，跳过 chunk 内的 connection record，再校验目标记录是 `MSGDATA`。
+4. 读取每个 `CHUNK_INFO`，建立 chunk 位置、时间范围和 index record 数。
+5. 按 chunk 读取 `CHUNK` header 和 `IDXDATA`；文件内容不保留在内存，索引项紧凑保存时间戳、chunk 序号和消息偏移。
+6. cursor 以每连接一个堆项合并索引，按需 seek 并流式解压一个 chunk，跳过 chunk 内的 connection record，再校验目标记录是 `MSGDATA`。
 
-支持的 chunk 压缩为 `none`、`lz4`，以及在找到 BZip2 开发库时的 `bz2`。ROS1 payload 原样返回；ROS1 内置 `Header` 解码包含 legacy `seq` 字段。
+支持的 chunk 压缩为 `none`、`lz4`，以及在找到 BZip2 开发库时的 `bz2`。LZ4/BZip2 使用定长 I/O buffer 流式解压；默认 256 MiB 的解压上限可由 `ReaderOptions` 调整。ROS1 payload 原样返回；ROS1 内置 `Header` 解码包含 legacy `seq` 字段。
 
 ### 6.2 ROS2 SQLite3 文件
 
@@ -195,8 +195,8 @@ MCAP 依赖由 CMake 按 `ROSBAGS_MCAP_ROOT`、已安装 `mcap` 包、FetchConte
 
 ## 10. 已知限制与后续扩展点
 
-- `AnyReader` 为全局排序暂存消息，超大文件集合需要应用分批读取或直接使用单个 `Reader`。
-- ROS1 bag 的 chunk 读取按文件载入内存；对于超大 ROS1 文件，内存峰值主要由原始文件和解压缓存决定。
+- `AnyReader` 的内存随输入数量、每路当前 payload 和每个 ROS1 输入最近使用的一个 chunk 增长，而不是随总 payload 增长；大量超大并行输入仍应按任务拆分。
+- ROS1 不再整包载入内存；精确排序仍要求常驻 `IDXDATA` 索引，单个解压 chunk 受 `ReaderOptions::max_rosbag1_chunk_bytes` 约束。
 - 当前没有 writer、转换器、ROS graph 发布器或动态类型支持加载器。
 - 基础 IDL 生成器不处理完整 IDL module、常量语义、注解和所有 ROS action/service 结构。
 - ROS1 读取要求 bag 已建立索引；未索引 bag 和加密 bag 当前不支持。

@@ -261,7 +261,26 @@ int main() {
 
 过滤规则为：topic 规范化后匹配，`start` 包含，`stop` 不包含。`connection_ids` 也可以直接指定连接 ID；通常优先使用 topic 过滤。
 
-### 4.3 内置类型解码
+### 4.3 增量游标和 ROS1 内存上限
+
+`messages()` 返回只能移动的 `MessageCursor`，适合需要暂停、限速或自行管理读取节奏的应用；`read_raw()` 仍是等价的回调封装。
+
+```cpp
+rosbags::ReaderOptions options;
+options.max_rosbag1_chunk_bytes = 128U * 1024U * 1024U;
+rosbags::Reader reader("/data/recording.bag", options);
+reader.open();
+
+auto cursor = reader.messages();
+rosbags::Message message;
+while (cursor.next(message)) {
+  // 仅当前消息 payload 被交付。
+}
+```
+
+ROS1 默认上限为 256 MiB，限制的是单个 chunk 的解压后大小；超过限制会抛出 `ResourceLimitError`，而不是尝试分配无界内存。`Reader` 和 `AnyReader` 的 cursor 都会共享持有内部状态，因此移动或销毁 reader 外壳不会使 cursor 失效；两类 cursor 都必须在显式 `close()` 前销毁。ROS1 为精确时间排序仍保存消息索引，因此极大消息数的索引内存不受这个选项限制。
+
+### 4.4 内置类型解码
 
 ```cpp
 #include <rosbags/profiles.hpp>
@@ -287,7 +306,7 @@ int main() {
 
 ROS1 输入使用 `ros1_noetic`，ROS2 CDR 输入使用对应的 `ros2_*` profile。profile 参与 registry key；类型已注册但 profile 不匹配时仍会被视为未知类型。
 
-### 4.4 未知类型策略
+### 4.5 未知类型策略
 
 ```cpp
 const auto decoded = rosbags::decode(
@@ -308,7 +327,7 @@ if (decoded && decoded->raw_only()) {
 | `WarnAndRaw` | warning 后返回 `raw_only()`，可以继续使用 `source->bytes`。 |
 | `Error` | 立即抛出 `DecodeError`。 |
 
-### 4.5 多文件读取：`AnyReader`
+### 4.6 多文件读取：`AnyReader`
 
 ```cpp
 rosbags::AnyReader reader({
@@ -321,7 +340,7 @@ reader.read_raw({}, [](const rosbags::Message& message) {
 });
 ```
 
-所有输入必须属于同一个 ROS 世代。ROS1 与 ROS2 混用会抛出 `RosbagsError`。`AnyReader` 为全局排序暂存消息，输入很多或消息很大时应考虑分批处理。
+所有输入必须属于同一个 ROS 世代。ROS1 与 ROS2 混用会抛出 `RosbagsError`。`AnyReader` 以 K 路合并维持全局稳定时间顺序，每个输入仅保留一条当前消息以及后端所需的有界缓存；ROS1 后端保留最近使用的一个 chunk，避免逐消息重复读取和解压。应用主动保留 `Message::bytes` 仍会相应增加自身内存。
 
 ## 5. 自定义消息类型
 

@@ -4,19 +4,142 @@
 
 namespace rosbags {
 
+struct MessageCursor::Impl {
+  virtual ~Impl() = default;
+  virtual bool next(Message& output) = 0;
+};
+
+namespace {
+
+class BackendCursorImpl final : public MessageCursor::Impl {
+ public:
+  BackendCursorImpl(std::shared_ptr<void> owner, std::unique_ptr<internal::BackendCursor> cursor)
+      : owner_(std::move(owner)), cursor_(std::move(cursor)) {}
+  bool next(Message& output) override { return cursor_->next(output); }
+
+ private:
+  // Keep the backend alive until after its cursor has been destroyed.
+  std::shared_ptr<void> owner_;
+  std::unique_ptr<internal::BackendCursor> cursor_;
+};
+
+}  // namespace
+
+struct AnyReader::Impl {
+  std::vector<std::unique_ptr<Reader>> readers;
+  std::vector<Connection> connections;
+  ReaderMetadata metadata;
+  bool open = false;
+};
+
+class AnyReaderCursorImpl final : public MessageCursor::Impl {
+ public:
+  AnyReaderCursorImpl(std::shared_ptr<AnyReader::Impl> owner, const ReadFilter& filter)
+      : owner_(std::move(owner)) {
+    std::size_t global_index = 0;
+    for (const auto& reader : owner_->readers) {
+      Source source;
+      const auto& local_connections = reader->connections();
+      source.global_index = global_index;
+      source.local_positions.reserve(local_connections.size());
+      for (std::size_t index = 0; index < local_connections.size(); ++index)
+        source.local_positions.emplace(&local_connections[index], index);
+
+      ReadFilter local = filter;
+      local.connection_ids.clear();
+      if (!filter.connection_ids.empty()) {
+        for (std::size_t index = 0; index < local_connections.size(); ++index) {
+          const auto global_id = owner_->connections[global_index + index].id;
+          if (std::find(filter.connection_ids.begin(), filter.connection_ids.end(), global_id) !=
+              filter.connection_ids.end())
+            local.connection_ids.push_back(local_connections[index].id);
+        }
+      }
+      if (filter.connection_ids.empty() || !local.connection_ids.empty()) {
+        source.cursor.emplace(reader->messages(local));
+        sources_.push_back(std::move(source));
+        pull(sources_.size() - 1);
+      }
+      global_index += local_connections.size();
+    }
+  }
+
+  bool next(Message& output) override {
+    if (!owner_->open) throw RosbagsError("reader is not open");
+    if (pending_source_) {
+      pull(*pending_source_);
+      pending_source_.reset();
+    }
+    if (heap_.empty()) return false;
+    const auto item = heap_.top();
+    heap_.pop();
+    auto& source = sources_[item.source];
+    output = std::move(*source.head);
+    source.head.reset();
+    pending_source_ = item.source;
+    return true;
+  }
+
+ private:
+  struct Source {
+    std::optional<MessageCursor> cursor;
+    std::size_t global_index = 0;
+    std::unordered_map<const Connection*, std::size_t> local_positions;
+    std::optional<Message> head;
+  };
+  struct HeapItem {
+    std::uint64_t timestamp = 0;
+    std::size_t source = 0;
+  };
+  struct HeapCompare {
+    bool operator()(const HeapItem& left, const HeapItem& right) const {
+      if (left.timestamp != right.timestamp) return left.timestamp > right.timestamp;
+      return left.source > right.source;
+    }
+  };
+
+  void pull(std::size_t source_index) {
+    auto& source = sources_[source_index];
+    Message message;
+    if (!source.cursor || !source.cursor->next(message)) return;
+    const auto position = source.local_positions.find(message.connection);
+    if (position == source.local_positions.end()) throw RosbagsError("backend returned unknown connection");
+    message.connection = &owner_->connections[source.global_index + position->second];
+    source.head = std::move(message);
+    heap_.push({source.head->timestamp, source_index});
+  }
+
+  std::shared_ptr<AnyReader::Impl> owner_;
+  std::vector<Source> sources_;
+  std::priority_queue<HeapItem, std::vector<HeapItem>, HeapCompare> heap_;
+  std::optional<std::size_t> pending_source_;
+};
+
+MessageCursor::MessageCursor(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+MessageCursor::~MessageCursor() = default;
+MessageCursor::MessageCursor(MessageCursor&&) noexcept = default;
+MessageCursor& MessageCursor::operator=(MessageCursor&&) noexcept = default;
+bool MessageCursor::next(Message& output) {
+  if (!impl_) throw RosbagsError("message cursor is not initialized");
+  return impl_->next(output);
+}
+
 struct Reader::Impl {
   explicit Impl(std::string value) : path(std::move(value)) {}
+  ~Impl() {
+    if (backend) backend->close();
+  }
   std::string path;
   std::unique_ptr<internal::Backend> backend;
 };
 
-Reader::Reader(std::string path) : impl_(std::make_unique<Impl>(std::move(path))) {
+Reader::Reader(std::string path, ReaderOptions options) : impl_(std::make_shared<Impl>(std::move(path))) {
   const std::filesystem::path input(impl_->path);
   if (!std::filesystem::exists(input)) throw RosbagsError("path does not exist: " + impl_->path);
   if (std::filesystem::is_directory(input)) {
     impl_->backend = internal::make_directory_backend(impl_->path);
   } else if (input.extension() == ".bag") {
-    impl_->backend = internal::make_rosbag1_backend(impl_->path);
+    impl_->backend = internal::make_rosbag1_backend(impl_->path, options);
   } else if (input.extension() == ".mcap") {
     impl_->backend = internal::make_mcap_backend(impl_->path);
   } else {
@@ -25,7 +148,7 @@ Reader::Reader(std::string path) : impl_(std::make_unique<Impl>(std::move(path))
   }
 }
 
-Reader::~Reader() { close(); }
+Reader::~Reader() = default;
 Reader::Reader(Reader&&) noexcept = default;
 Reader& Reader::operator=(Reader&&) noexcept = default;
 
@@ -49,9 +172,16 @@ StorageKind Reader::storage_kind() const {
 const std::string& Reader::path() const noexcept { return impl_->path; }
 const ReaderMetadata& Reader::metadata() const { return impl_->backend->metadata(); }
 const std::vector<Connection>& Reader::connections() const { return impl_->backend->connections(); }
+MessageCursor Reader::messages(const ReadFilter& filter) const {
+  if (!is_open()) throw RosbagsError("reader is not open");
+  auto cursor = impl_->backend->make_cursor(filter);
+  return MessageCursor(std::make_unique<BackendCursorImpl>(impl_, std::move(cursor)));
+}
 void Reader::read_raw(const ReadFilter& filter, const MessageCallback& callback) const {
   if (!callback) throw RosbagsError("message callback is empty");
-  impl_->backend->read_raw(filter, callback);
+  auto cursor = messages(filter);
+  Message message;
+  while (cursor.next(message)) callback(message);
 }
 void Reader::read_decoded(const ReadFilter& filter, const TypeRegistry& registry, std::string_view profile,
                           const DecodedCallback& callback, UnknownTypePolicy policy,
@@ -62,51 +192,55 @@ void Reader::read_decoded(const ReadFilter& filter, const TypeRegistry& registry
   });
 }
 
-AnyReader::AnyReader(std::vector<std::string> paths) : paths_(std::move(paths)) {
-  if (paths_.empty()) throw RosbagsError("at least one input path is required");
-  for (const auto& path : paths_) readers_.push_back(std::make_unique<Reader>(path));
+AnyReader::AnyReader(std::vector<std::string> paths, ReaderOptions options) : impl_(std::make_shared<Impl>()) {
+  if (paths.empty()) throw RosbagsError("at least one input path is required");
+  for (auto& path : paths) impl_->readers.push_back(std::make_unique<Reader>(std::move(path), options));
 }
+AnyReader::~AnyReader() = default;
+AnyReader::AnyReader(AnyReader&&) noexcept = default;
+AnyReader& AnyReader::operator=(AnyReader&&) noexcept = default;
 
 void AnyReader::open() {
-  if (open_) throw RosbagsError("reader is already open");
+  if (!impl_) throw RosbagsError("reader is not initialized");
+  if (impl_->open) throw RosbagsError("reader is already open");
   try {
-    for (const auto& reader : readers_) reader->open();
-    const auto first_kind = readers_.front()->storage_kind();
+    for (const auto& reader : impl_->readers) reader->open();
+    const auto first_kind = impl_->readers.front()->storage_kind();
     const bool first_is_ros1 = first_kind == StorageKind::Rosbag1;
-    for (const auto& reader : readers_) {
+    for (const auto& reader : impl_->readers) {
       if ((reader->storage_kind() == StorageKind::Rosbag1) != first_is_ros1)
         throw RosbagsError("ROS1 and ROS2 inputs cannot be mixed");
     }
 
-    connections_.clear();
+    impl_->connections.clear();
     std::uint32_t next_id = 1;
-    for (const auto& reader : readers_) {
+    for (const auto& reader : impl_->readers) {
       for (const auto& connection : reader->connections()) {
         auto copy = connection;
         copy.id = next_id++;
-        connections_.push_back(std::move(copy));
+        impl_->connections.push_back(std::move(copy));
       }
     }
 
-    metadata_ = ReaderMetadata{};
-    metadata_.storage = first_kind;
-    metadata_.start_time = std::numeric_limits<std::uint64_t>::max();
+    impl_->metadata = ReaderMetadata{};
+    impl_->metadata.storage = first_kind;
+    impl_->metadata.start_time = std::numeric_limits<std::uint64_t>::max();
     bool have_messages = false;
-    for (const auto& reader : readers_) {
+    for (const auto& reader : impl_->readers) {
       const auto& metadata = reader->metadata();
       if (metadata.message_count) {
         have_messages = true;
-        metadata_.start_time = std::min(metadata_.start_time, metadata.start_time);
-        metadata_.end_time = std::max(metadata_.end_time, metadata.end_time);
+        impl_->metadata.start_time = std::min(impl_->metadata.start_time, metadata.start_time);
+        impl_->metadata.end_time = std::max(impl_->metadata.end_time, metadata.end_time);
       }
-      metadata_.message_count += metadata.message_count;
-      metadata_.files.insert(metadata_.files.end(), metadata.files.begin(), metadata.files.end());
+      impl_->metadata.message_count += metadata.message_count;
+      impl_->metadata.files.insert(impl_->metadata.files.end(), metadata.files.begin(), metadata.files.end());
     }
-    if (!have_messages) metadata_.start_time = 0;
-    metadata_.duration = metadata_.end_time >= metadata_.start_time
-                             ? metadata_.end_time - metadata_.start_time
-                             : 0;
-    open_ = true;
+    if (!have_messages) impl_->metadata.start_time = 0;
+    impl_->metadata.duration = impl_->metadata.end_time >= impl_->metadata.start_time
+                                   ? impl_->metadata.end_time - impl_->metadata.start_time
+                                   : 0;
+    impl_->open = true;
   } catch (...) {
     close();
     throw;
@@ -114,61 +248,30 @@ void AnyReader::open() {
 }
 
 void AnyReader::close() noexcept {
-  for (const auto& reader : readers_) reader->close();
-  open_ = false;
-  connections_.clear();
+  if (!impl_) return;
+  for (const auto& reader : impl_->readers) reader->close();
+  impl_->open = false;
+  impl_->connections.clear();
 }
-bool AnyReader::is_open() const noexcept { return open_; }
+bool AnyReader::is_open() const noexcept { return impl_ && impl_->open; }
 const ReaderMetadata& AnyReader::metadata() const {
-  if (!open_) throw RosbagsError("reader is not open");
-  return metadata_;
+  if (!is_open()) throw RosbagsError("reader is not open");
+  return impl_->metadata;
 }
 const std::vector<Connection>& AnyReader::connections() const {
-  if (!open_) throw RosbagsError("reader is not open");
-  return connections_;
+  if (!is_open()) throw RosbagsError("reader is not open");
+  return impl_->connections;
 }
 
+MessageCursor AnyReader::messages(const ReadFilter& filter) const {
+  if (!is_open()) throw RosbagsError("reader is not open");
+  return MessageCursor(std::make_unique<AnyReaderCursorImpl>(impl_, filter));
+}
 void AnyReader::read_raw(const ReadFilter& filter, const MessageCallback& callback) const {
-  if (!open_) throw RosbagsError("reader is not open");
   if (!callback) throw RosbagsError("message callback is empty");
-
-  std::vector<Message> all;
-  std::size_t global_index = 0;
-  for (const auto& reader : readers_) {
-    const auto& local_connections = reader->connections();
-    const auto local_count = local_connections.size();
-    std::unordered_map<const Connection*, std::size_t> local_positions;
-    local_positions.reserve(local_count);
-    for (std::size_t i = 0; i < local_count; ++i) local_positions.emplace(&local_connections[i], i);
-    ReadFilter local = filter;
-    local.connection_ids.clear();
-    if (!filter.connection_ids.empty()) {
-      for (std::size_t i = 0; i < local_count; ++i) {
-        const auto global_id = connections_[global_index + i].id;
-        if (std::find(filter.connection_ids.begin(), filter.connection_ids.end(), global_id) !=
-            filter.connection_ids.end())
-          local.connection_ids.push_back(local_connections[i].id);
-      }
-      if (local.connection_ids.empty()) {
-        global_index += local_count;
-        continue;
-      }
-    }
-    reader->read_raw(local, [&](const Message& message) {
-      const auto position = local_positions.find(message.connection);
-      if (position == local_positions.end()) throw RosbagsError("backend returned unknown connection");
-      auto copy = message;
-      copy.connection = &connections_[global_index + position->second];
-      all.push_back(std::move(copy));
-    });
-    global_index += local_count;
-  }
-  std::stable_sort(all.begin(), all.end(), [](const Message& a, const Message& b) {
-    return a.timestamp < b.timestamp;
-  });
-  for (const auto& message : all) {
-    if (internal::in_time(message.timestamp, filter)) callback(message);
-  }
+  auto cursor = messages(filter);
+  Message message;
+  while (cursor.next(message)) callback(message);
 }
 void AnyReader::read_decoded(const ReadFilter& filter, const TypeRegistry& registry, std::string_view profile,
                              const DecodedCallback& callback, UnknownTypePolicy policy,

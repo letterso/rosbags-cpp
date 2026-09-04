@@ -83,9 +83,41 @@ class RosbagsError : public std::runtime_error {
 class FormatError : public RosbagsError { using RosbagsError::RosbagsError; };
 class UnsupportedFeature : public RosbagsError { using RosbagsError::RosbagsError; };
 class DecodeError : public RosbagsError { using RosbagsError::RosbagsError; };
+class ResourceLimitError : public RosbagsError { using RosbagsError::RosbagsError; };
 
 using WarningCallback = std::function<void(std::string_view)>;
 using MessageCallback = std::function<void(const Message&)>;
+
+struct ReaderOptions {
+  // ROS1 compresses whole chunks.  The reader must materialize one such chunk
+  // before it can seek to an indexed message offset.
+  std::size_t max_rosbag1_chunk_bytes = 256U * 1024U * 1024U;
+};
+
+class Reader;
+class AnyReader;
+class AnyReaderCursorImpl;
+
+class MessageCursor {
+ public:
+  struct Impl;
+
+  ~MessageCursor();
+  MessageCursor(MessageCursor&&) noexcept;
+  MessageCursor& operator=(MessageCursor&&) noexcept;
+  MessageCursor(const MessageCursor&) = delete;
+  MessageCursor& operator=(const MessageCursor&) = delete;
+
+  // Stores the next message in output and returns false at end of input.
+  bool next(Message& output);
+
+ private:
+  explicit MessageCursor(std::unique_ptr<Impl> impl);
+  std::unique_ptr<Impl> impl_;
+
+  friend class Reader;
+  friend class AnyReader;
+};
 
 class TypeRegistry;
 struct DecodedMessage;
@@ -93,7 +125,7 @@ using DecodedCallback = std::function<void(const Message&, const DecodedMessage&
 
 class Reader {
  public:
-  explicit Reader(std::string path);
+  explicit Reader(std::string path, ReaderOptions options = {});
   virtual ~Reader();
   Reader(const Reader&) = delete;
   Reader& operator=(const Reader&) = delete;
@@ -107,6 +139,7 @@ class Reader {
   const std::string& path() const noexcept;
   const ReaderMetadata& metadata() const;
   const std::vector<Connection>& connections() const;
+  MessageCursor messages(const ReadFilter& filter = {}) const;
   void read_raw(const ReadFilter& filter, const MessageCallback& callback) const;
   void read_decoded(const ReadFilter& filter, const TypeRegistry& registry, std::string_view profile,
                     const DecodedCallback& callback, UnknownTypePolicy policy = UnknownTypePolicy::WarnAndSkip,
@@ -114,28 +147,33 @@ class Reader {
 
  private:
   struct Impl;
-  std::unique_ptr<Impl> impl_;
+  std::shared_ptr<Impl> impl_;
 };
 
 class AnyReader {
  public:
-  explicit AnyReader(std::vector<std::string> paths);
+  explicit AnyReader(std::vector<std::string> paths, ReaderOptions options = {});
+  ~AnyReader();
+  AnyReader(const AnyReader&) = delete;
+  AnyReader& operator=(const AnyReader&) = delete;
+  AnyReader(AnyReader&&) noexcept;
+  AnyReader& operator=(AnyReader&&) noexcept;
+
   void open();
   void close() noexcept;
   bool is_open() const noexcept;
   const ReaderMetadata& metadata() const;
   const std::vector<Connection>& connections() const;
+  MessageCursor messages(const ReadFilter& filter = {}) const;
   void read_raw(const ReadFilter& filter, const MessageCallback& callback) const;
   void read_decoded(const ReadFilter& filter, const TypeRegistry& registry, std::string_view profile,
                     const DecodedCallback& callback, UnknownTypePolicy policy = UnknownTypePolicy::WarnAndSkip,
                     const WarningCallback& warning = {}) const;
 
  private:
-  std::vector<std::string> paths_;
-  std::vector<std::unique_ptr<Reader>> readers_;
-  std::vector<Connection> connections_;
-  ReaderMetadata metadata_;
-  bool open_ = false;
+  struct Impl;
+  friend class AnyReaderCursorImpl;
+  std::shared_ptr<Impl> impl_;
 };
 
 struct TypeSupportBase {

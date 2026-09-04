@@ -75,43 +75,10 @@ class McapBackend final : public Backend {
   StorageKind kind() const override { ensure_open(); return StorageKind::Mcap; }
   const ReaderMetadata& metadata() const override { ensure_open(); return metadata_; }
   const std::vector<Connection>& connections() const override { ensure_open(); return connections_; }
-  void read_raw(const ReadFilter& filter, const MessageCallback& callback) const override {
-    ensure_open();
-#if ROSBAGS_HAS_MCAP
-    mcap::ReadMessageOptions options;
-    options.startTime = filter.start.value_or(0);
-    options.endTime = filter.stop.value_or(mcap::MaxTime);
-    options.readOrder = mcap::ReadMessageOptions::ReadOrder::LogTimeOrder;
-    if (!filter.topics.empty()) {
-      options.topicFilter = [&filter](std::string_view topic) {
-        const auto normalized = normalize_topic(topic);
-        return std::any_of(filter.topics.begin(), filter.topics.end(), [&](const auto& requested) {
-          return normalize_topic(requested) == normalized;
-        });
-      };
-    }
-    std::optional<mcap::Status> problem;
-    const auto on_problem = [&problem](const mcap::Status& status) {
-      if (!status.ok() && !problem) problem = status;
-    };
-    for (const auto& view : reader_.readMessages(on_problem, options)) {
-      const auto& channel = view.channel;
-      if (!channel) continue;
-      const auto id = channel->id;
-      const auto it = std::find_if(connections_.begin(), connections_.end(), [&](const auto& value) { return value.id == id; });
-      if (it == connections_.end() || !has_topic(*it, filter)) continue;
-      const auto& message = view.message;
-      auto bytes = std::make_shared<Bytes>(reinterpret_cast<const Byte*>(message.data), reinterpret_cast<const Byte*>(message.data) + message.dataSize);
-      callback(Message{std::move(bytes), message.logTime, &*it});
-    }
-    if (problem) throw FormatError(context(path_, "MCAP message scan failed: " + problem->message));
-#else
-    (void)filter;
-    (void)callback;
-#endif
-  }
+  std::unique_ptr<BackendCursor> make_cursor(const ReadFilter& filter) const override;
 
  private:
+  class Cursor;
   void ensure_open() const { if (!open_) throw RosbagsError("MCAP reader is not open"); }
   std::string path_;
   ReaderMetadata metadata_;
@@ -123,6 +90,86 @@ class McapBackend final : public Backend {
   std::unordered_map<mcap::ChannelId, mcap::ChannelPtr> channels_;
 #endif
 };
+
+class McapBackend::Cursor final : public BackendCursor {
+ public:
+  Cursor(const McapBackend& owner, ReadFilter filter) : owner_(owner), filter_(std::move(filter)) {
+    owner_.ensure_open();
+#if ROSBAGS_HAS_MCAP
+    const auto open_status = reader_.open(owner_.path_);
+    if (!open_status.ok()) throw FormatError(context(owner_.path_, "MCAP SDK failed to open file"));
+    const auto summary = reader_.readSummary(mcap::ReadSummaryMethod::AllowFallbackScan);
+    if (!summary.ok()) throw FormatError(context(owner_.path_, "MCAP summary scan failed"));
+    mcap::ReadMessageOptions options;
+    options.startTime = filter_.start.value_or(0);
+    options.endTime = filter_.stop.value_or(mcap::MaxTime);
+    options.readOrder = mcap::ReadMessageOptions::ReadOrder::LogTimeOrder;
+    if (!filter_.topics.empty()) {
+      options.topicFilter = [filter = filter_](std::string_view topic) {
+        const auto normalized = normalize_topic(topic);
+        return std::any_of(filter.topics.begin(), filter.topics.end(), [&](const auto& requested) {
+          return normalize_topic(requested) == normalized;
+        });
+      };
+    }
+    const auto on_problem = [this](const mcap::Status& status) {
+      if (!status.ok() && !problem_) problem_ = status;
+    };
+    view_.emplace(reader_.readMessages(on_problem, options));
+    iterator_.emplace(view_->begin());
+#else
+    (void)filter_;
+    throw UnsupportedFeature("MCAP support is disabled: official mcap C++ SDK was not found");
+#endif
+  }
+
+  bool next(Message& output) override {
+    owner_.ensure_open();
+#if ROSBAGS_HAS_MCAP
+    while (iterator_ && *iterator_ != view_->end()) {
+      const auto& view = **iterator_;
+      const auto& channel = view.channel;
+      if (!channel) {
+        ++(*iterator_);
+        continue;
+      }
+      const auto it = std::find_if(owner_.connections_.begin(), owner_.connections_.end(), [&](const auto& value) {
+        return value.id == channel->id;
+      });
+      if (it == owner_.connections_.end() || !has_topic(*it, filter_)) {
+        ++(*iterator_);
+        continue;
+      }
+      const auto& message = view.message;
+      auto bytes = std::make_shared<Bytes>(reinterpret_cast<const Byte*>(message.data),
+                                           reinterpret_cast<const Byte*>(message.data) + message.dataSize);
+      const auto timestamp = message.logTime;
+      ++(*iterator_);
+      output = Message{std::move(bytes), timestamp, &*it};
+      return true;
+    }
+    if (problem_) throw FormatError(context(owner_.path_, "MCAP message scan failed: " + problem_->message));
+    return false;
+#else
+    (void)output;
+    return false;
+#endif
+  }
+
+ private:
+  const McapBackend& owner_;
+  ReadFilter filter_;
+#if ROSBAGS_HAS_MCAP
+  mcap::McapReader reader_;
+  std::optional<mcap::LinearMessageView> view_;
+  std::optional<mcap::LinearMessageView::Iterator> iterator_;
+  std::optional<mcap::Status> problem_;
+#endif
+};
+
+std::unique_ptr<BackendCursor> McapBackend::make_cursor(const ReadFilter& filter) const {
+  return std::make_unique<Cursor>(*this, filter);
+}
 
 }  // namespace
 
