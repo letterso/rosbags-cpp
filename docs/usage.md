@@ -59,6 +59,12 @@ cmake -S . -B build-mcap \
   -DROSBAGS_MCAP_BUILDER_TAG=main
 ```
 
+`mcap_builder` 使用 CMake config package 查找 LZ4 和 zstd，而 Ubuntu 的
+开发包通常仅提供 pkg-config 文件。MCAP 自动构建时，本项目会在构建目录
+生成私有的 `lz4Config.cmake` 和 `zstdConfig.cmake` 适配包，分别导出
+`LZ4::lz4` 与 `zstd::libzstd` 并链接到 `PkgConfig::LZ4`、
+`PkgConfig::ZSTD`；无需向系统安装额外的 CMake 包文件。
+
 ### 1.3 安装和下游工程
 
 ```bash

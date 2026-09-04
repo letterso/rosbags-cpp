@@ -1,0 +1,13 @@
+# Compatibility package for mcap_builder's `find_package(zstd)` call.
+# The parent project has already resolved libzstd through pkg-config.
+if(NOT TARGET PkgConfig::ZSTD)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
+endif()
+
+if(NOT TARGET zstd::libzstd)
+  add_library(zstd::libzstd INTERFACE IMPORTED)
+  set_property(TARGET zstd::libzstd PROPERTY INTERFACE_LINK_LIBRARIES PkgConfig::ZSTD)
+endif()
+
+set(zstd_FOUND TRUE)

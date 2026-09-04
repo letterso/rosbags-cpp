@@ -1,0 +1,13 @@
+# Compatibility package for mcap_builder's `find_package(lz4)` call.
+# The parent project has already resolved liblz4 through pkg-config.
+if(NOT TARGET PkgConfig::LZ4)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(LZ4 REQUIRED IMPORTED_TARGET liblz4)
+endif()
+
+if(NOT TARGET LZ4::lz4)
+  add_library(LZ4::lz4 INTERFACE IMPORTED)
+  set_property(TARGET LZ4::lz4 PROPERTY INTERFACE_LINK_LIBRARIES PkgConfig::LZ4)
+endif()
+
+set(lz4_FOUND TRUE)

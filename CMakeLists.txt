@@ -54,6 +54,28 @@ if(ROSBAGS_ENABLE_MCAP)
     endif()
   endif()
   if(NOT ROSBAGS_HAS_MCAP)
+    # mcap_builder discovers its optional compression dependencies via CMake
+    # config packages, while Debian/Ubuntu's liblz4-dev and libzstd-dev expose
+    # them through pkg-config.  Generate private compatibility packages that
+    # adapt our already-validated PkgConfig targets to its required target
+    # names.  They are only added to this configure's search path.
+    set(ROSBAGS_MCAP_COMPAT_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/mcap_compat")
+    file(MAKE_DIRECTORY
+      "${ROSBAGS_MCAP_COMPAT_PREFIX}/lib/cmake/lz4"
+      "${ROSBAGS_MCAP_COMPAT_PREFIX}/lib/cmake/zstd"
+    )
+    configure_file(
+      cmake/lz4Config.cmake.in
+      "${ROSBAGS_MCAP_COMPAT_PREFIX}/lib/cmake/lz4/lz4Config.cmake"
+      @ONLY
+    )
+    configure_file(
+      cmake/zstdConfig.cmake.in
+      "${ROSBAGS_MCAP_COMPAT_PREFIX}/lib/cmake/zstd/zstdConfig.cmake"
+      @ONLY
+    )
+    list(APPEND CMAKE_PREFIX_PATH "${ROSBAGS_MCAP_COMPAT_PREFIX}")
+
     include(FetchContent)
     FetchContent_Declare(
       mcap_builder
