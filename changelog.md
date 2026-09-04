@@ -2,6 +2,32 @@
 
 本文件记录 `rosbags-cpp` 的版本更新。
 
+## [0.1.2] - 2026-09-04
+
+### 新增
+
+- 增加 `std_msgs`、`geometry_msgs`、`sensor_msgs` 和 `nav_msgs` 内置 profile，覆盖常用基础、几何、传感器和导航消息的 ROS1/ROS2 wire 解码。
+- 为 `Reader` 和 `AnyReader` 增加可移动的增量 `MessageCursor` API，支持应用自行暂停、限速和分批读取。
+- 增加 `ReaderOptions::max_rosbag1_chunk_bytes` 与 `ResourceLimitError`，限制 ROS1 单个 chunk 解压后的内存占用，默认上限为 256 MiB。
+
+### 修复
+
+- 将 ROS1、ROS2 SQLite、MCAP 和 ROS2 目录后端改为基于 cursor 的增量读取；`AnyReader` 使用堆合并各输入，保持稳定的时间顺序，避免全量缓存消息 payload。
+- ROS1 改为按需定位并流式解压 chunk，支持 LZ4/BZip2 解压过程的边界、大小、截断和尾部数据校验，不再将整个 bag 文件载入内存。
+- 完善 ROS1/ROS2 元数据、时间戳、SQLite payload、压缩帧和目录资源的边界检查及异常清理，减少 malformed input 导致的资源泄漏或无界分配。
+- 强化消息生成器的字段标识符和输入校验，处理 C++ 关键字转义、内置类型引用、重复/冲突定义、循环依赖和生成文件写入失败，并按依赖顺序生成消息类型。
+- 修复 MCAP 自动构建时无法通过 CMake 找到 LZ4 和 zstd 的问题，并固定 `mcap_builder` 的版本提交。
+
+### 重构
+
+- 抽取 `DirectoryBackend::close_impl()`，统一目录后端关闭和 `open()` 失败时的子资源清理路径。
+
+### 测试与工程维护
+
+- 增加 Cppcheck 静态检查目标 `rosbags_cpp_cppcheck`，并统一库、工具和测试目标的编译警告选项。
+- 增加内置 profile、代码生成依赖排序、未知大小 zstd 帧、ROS1 LZ4 chunk、单 chunk 资源上限、cursor 生命周期及多输入稳定合并顺序的回归测试。
+- 新增 `changelog.md`，记录项目版本更新。
+
 ## [0.1.1] - 2026-09-03
 
 ### 新增
