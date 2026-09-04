@@ -8,6 +8,7 @@
 #include <fstream>
 #include <regex>
 #include <sstream>
+#include <unordered_map>
 
 namespace rosbags::codegen {
 namespace {
@@ -26,7 +27,7 @@ struct Definition {
   std::vector<Field> fields;
 };
 
-std::string trim(std::string value) {
+std::string trim(const std::string& value) {
   const auto first = value.find_first_not_of(" \t\r\n");
   if (first == std::string::npos) return {};
   const auto last = value.find_last_not_of(" \t\r\n");
@@ -34,7 +35,40 @@ std::string trim(std::string value) {
 }
 std::string sanitize(std::string value) {
   for (auto& character : value) if (!std::isalnum(static_cast<unsigned char>(character))) character = '_';
+  if (value.empty() || std::isdigit(static_cast<unsigned char>(value.front()))) value.insert(value.begin(), '_');
+  static const std::vector<std::string_view> keywords = {
+      "alignas", "alignof", "and", "and_eq", "asm", "auto", "bitand", "bitor", "bool", "break",
+      "case", "catch", "char", "class", "compl", "const", "constexpr", "const_cast", "continue",
+      "decltype", "default", "delete", "do", "double", "dynamic_cast", "else", "enum", "explicit",
+      "export", "extern", "false", "float", "for", "friend", "goto", "if", "inline", "int", "long",
+      "mutable", "namespace", "new", "noexcept", "not", "not_eq", "nullptr", "operator", "or",
+      "or_eq", "private", "protected", "public", "register", "reinterpret_cast", "return", "short",
+      "signed", "sizeof", "static", "static_assert", "static_cast", "struct", "switch", "template",
+      "this", "thread_local", "throw", "true", "try", "typedef", "typeid", "typename", "union",
+      "unsigned", "using", "virtual", "void", "volatile", "wchar_t", "while", "xor", "xor_eq"};
+  if (std::find(keywords.begin(), keywords.end(), value) != keywords.end()) value.push_back('_');
   return value;
+}
+bool valid_identifier(std::string_view value) {
+  if (value.empty() || (!std::isalpha(static_cast<unsigned char>(value.front())) && value.front() != '_'))
+    return false;
+  return std::all_of(value.begin() + 1, value.end(), [](unsigned char character) {
+    return std::isalnum(character) || character == '_';
+  });
+}
+std::string cpp_string(std::string_view value) {
+  std::string result;
+  result.reserve(value.size() + 2);
+  result.push_back('"');
+  for (const char character : value) {
+    if (character == '\\' || character == '"') result.push_back('\\');
+    if (character == '\n') result += "\\n";
+    else if (character == '\r') result += "\\r";
+    else if (character == '\t') result += "\\t";
+    else result.push_back(character);
+  }
+  result.push_back('"');
+  return result;
 }
 std::string primitive_cpp(const std::string& type) {
   if (type == "byte" || type == "char" || type == "uint8" || type == "octet") return "std::uint8_t";
@@ -117,6 +151,9 @@ Definition parse_msg(const std::filesystem::path& path, const std::filesystem::p
     std::string type;
     std::string name;
     if (!(tokens >> type >> name)) throw RosbagsError("malformed .msg field in " + path.string());
+    if (!valid_identifier(name)) throw RosbagsError("invalid .msg field name in " + path.string() + ": " + name);
+    std::string trailing;
+    if (tokens >> trailing) throw RosbagsError("unexpected tokens in .msg field in " + path.string());
     Field field;
     field.name = name;
     parse_type_suffix(type, field);
@@ -127,7 +164,6 @@ Definition parse_msg(const std::filesystem::path& path, const std::filesystem::p
 
 Definition parse_idl(const std::filesystem::path& path, const std::filesystem::path& root) {
   Definition result{package_from_file(path, root), path.stem().string(), {}, {}};
-  result.canonical = result.package + "/msg/" + result.name;
   std::ifstream input(path);
   if (!input) throw RosbagsError("cannot open IDL definition: " + path.string());
   std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
@@ -152,6 +188,8 @@ Definition parse_idl(const std::filesystem::path& path, const std::filesystem::p
       Field field;
       field.type = trim(line.substr(start, (comma == std::string::npos ? end : comma) - start));
       field.name = trim(line.substr(end + 1));
+      if (!valid_identifier(field.name))
+        throw RosbagsError("invalid IDL field name in " + path.string() + ": " + field.name);
       field.container = Field::Container::Sequence;
       if (comma != std::string::npos) field.bound = std::stoull(trim(line.substr(comma + 1, end - comma - 1)));
       result.fields.push_back(std::move(field));
@@ -167,6 +205,8 @@ Definition parse_idl(const std::filesystem::path& path, const std::filesystem::p
         name.resize(array);
       }
       field.name = name;
+      if (!valid_identifier(field.name))
+        throw RosbagsError("invalid IDL field name in " + path.string() + ": " + field.name);
       parse_type_suffix(type, field);
       result.fields.push_back(std::move(field));
     }
@@ -191,8 +231,47 @@ std::vector<Definition> collect(const GenerateOptions& options) {
     for (const auto& file : files) result.push_back(file.extension() == ".idl" ? parse_idl(file, root) : parse_msg(file, root));
   }
   std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) { return a.canonical < b.canonical; });
-  result.erase(std::unique(result.begin(), result.end(), [](const auto& a, const auto& b) { return a.canonical == b.canonical; }), result.end());
-  return result;
+  const auto same_definition = [](const Definition& left, const Definition& right) {
+    if (left.package != right.package || left.name != right.name || left.fields.size() != right.fields.size())
+      return false;
+    for (std::size_t i = 0; i < left.fields.size(); ++i) {
+      const auto& a = left.fields[i];
+      const auto& b = right.fields[i];
+      if (a.type != b.type || a.name != b.name || a.container != b.container || a.length != b.length ||
+          a.bound != b.bound)
+        return false;
+    }
+    return true;
+  };
+  std::vector<Definition> unique;
+  for (auto& definition : result) {
+    if (!unique.empty() && unique.back().canonical == definition.canonical) {
+      if (!same_definition(unique.back(), definition))
+        throw RosbagsError("conflicting definitions for " + definition.canonical);
+      continue;
+    }
+    unique.push_back(std::move(definition));
+  }
+
+  std::unordered_map<std::string, std::size_t> positions;
+  for (std::size_t i = 0; i < unique.size(); ++i) positions.emplace(unique[i].canonical, i);
+  std::vector<unsigned char> state(unique.size(), 0);
+  std::vector<Definition> ordered;
+  ordered.reserve(unique.size());
+  const std::function<void(std::size_t)> visit = [&](std::size_t index) {
+    if (state[index] == 2) return;
+    if (state[index] == 1) throw RosbagsError("cyclic by-value message dependency at " + unique[index].canonical);
+    state[index] = 1;
+    for (const auto& field : unique[index].fields) {
+      if (field.container == Field::Container::Sequence || is_primitive(field.type)) continue;
+      const auto dependency = positions.find(canonical_type(unique[index].package, field.type));
+      if (dependency != positions.end()) visit(dependency->second);
+    }
+    state[index] = 2;
+    ordered.push_back(unique[index]);
+  };
+  for (std::size_t i = 0; i < unique.size(); ++i) visit(i);
+  return ordered;
 }
 
 std::string field_type(const Definition& definition, const Field& field, std::string_view profile) {
@@ -213,24 +292,25 @@ void emit_reader(std::ostream& output, const Definition& definition, std::string
   const auto function = ros1 ? "ros1" : "cdr";
   output << "inline void read_" << function << "(" << reader << "& reader, " << namespace_for(definition, profile) << "::" << sanitize(definition.name) << "& message) {\n";
   for (const auto& field : definition.fields) {
+    const auto field_name = sanitize(field.name);
     const auto call = scalar_call(field);
     const bool nested = call.empty();
     if (field.container == Field::Container::Scalar) {
-      if (nested) output << "  read_" << function << "(reader, message." << field.name << ");\n";
-      else output << "  message." << field.name << " = " << call << ";\n";
+      if (nested) output << "  read_" << function << "(reader, message." << field_name << ");\n";
+      else output << "  message." << field_name << " = " << call << ";\n";
     } else if (field.container == Field::Container::Array) {
-      output << "  for (auto& value : message." << field.name << ") {\n";
+      output << "  for (auto& value : message." << field_name << ") {\n";
       if (nested) output << "    read_" << function << "(reader, value);\n";
       else output << "    value = " << call << ";\n";
       output << "  }\n";
     } else {
-      output << "  const auto size_" << field.name << " = reader.u32();\n";
-      if (field.bound) output << "  if (size_" << field.name << " > " << field.bound << ") throw DecodeError(\"bounded sequence exceeds declared capacity\");\n";
-      output << "  if (size_" << field.name << " > reader.remaining()) throw DecodeError(\"sequence length exceeds serialized payload\");\n";
-      output << "  message." << field.name << ".clear(); message." << field.name << ".reserve(size_" << field.name << ");\n";
-      output << "  for (std::uint32_t i = 0; i < size_" << field.name << "; ++i) {\n";
-      if (nested) output << "    " << local_type(definition, field.type, profile) << " value{}; read_" << function << "(reader, value); message." << field.name << ".push_back(std::move(value));\n";
-      else output << "    message." << field.name << ".push_back(" << call << ");\n";
+      output << "  const auto size_" << field_name << " = reader.u32();\n";
+      if (field.bound) output << "  if (size_" << field_name << " > " << field.bound << ") throw DecodeError(\"bounded sequence exceeds declared capacity\");\n";
+      output << "  if (size_" << field_name << " > reader.remaining()) throw DecodeError(\"sequence length exceeds serialized payload\");\n";
+      output << "  message." << field_name << ".clear(); message." << field_name << ".reserve(size_" << field_name << ");\n";
+      output << "  for (std::uint32_t i = 0; i < size_" << field_name << "; ++i) {\n";
+      if (nested) output << "    " << local_type(definition, field.type, profile) << " value{}; read_" << function << "(reader, value); message." << field_name << ".push_back(std::move(value));\n";
+      else output << "    message." << field_name << ".push_back(" << call << ");\n";
       output << "  }\n";
     }
   }
@@ -258,7 +338,8 @@ void generate(const GenerateOptions& options) {
     const auto ns = namespace_for(definition, options.profile);
     header << "namespace " << ns << " {\n";
     header << "struct " << sanitize(definition.name) << " {\n";
-    for (const auto& field : definition.fields) header << "  " << field_type(definition, field, options.profile) << " " << field.name << "{};\n";
+    for (const auto& field : definition.fields)
+      header << "  " << field_type(definition, field, options.profile) << " " << sanitize(field.name) << "{};\n";
     header << "};\n";
     header << "}\n";
   }
@@ -278,6 +359,8 @@ void generate(const GenerateOptions& options) {
     header << "inline " << qname << " deserialize_cdr_" << safe << "(ByteView bytes) { CdrReader reader(bytes); " << qname << " value{}; read_cdr(reader, value); reader.finish(); return value; }\n";
   }
   header << "}\n";
+  header.close();
+  if (!header) throw RosbagsError("cannot write generated header: " + header_path.string());
 
   const auto registry_path = output_dir / (sanitize(options.profile) + "_registry.hpp");
   std::ofstream registry(registry_path);
@@ -286,9 +369,15 @@ void generate(const GenerateOptions& options) {
   for (const auto& definition : definitions) {
     const auto qname = namespace_for(definition, options.profile) + "::" + sanitize(definition.name);
     const auto safe = sanitize(definition.canonical);
-    registry << "  registry.register_type(std::make_shared<rosbags::TypeSupport<" << qname << ">>(\"" << definition.canonical << "\", \"" << options.profile << "\", [](rosbags::ByteView bytes) { return detail::deserialize_ros1_" << safe << "(bytes); }, [](rosbags::ByteView bytes) { return detail::deserialize_cdr_" << safe << "(bytes); }));\n";
+    registry << "  registry.register_type(std::make_shared<rosbags::TypeSupport<" << qname << ">>("
+             << cpp_string(definition.canonical) << ", " << cpp_string(options.profile)
+             << ", [](rosbags::ByteView bytes) { return detail::deserialize_ros1_" << safe
+             << "(bytes); }, [](rosbags::ByteView bytes) { return detail::deserialize_cdr_" << safe
+             << "(bytes); }));\n";
   }
   registry << "}\n}\n";
+  registry.close();
+  if (!registry) throw RosbagsError("cannot write generated registry: " + registry_path.string());
 }
 
 }  // namespace rosbags::codegen

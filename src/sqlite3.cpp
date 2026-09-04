@@ -5,6 +5,8 @@
 
 #include <cstdio>
 #include <cctype>
+#include <cerrno>
+#include <unistd.h>
 
 namespace rosbags::internal {
 namespace {
@@ -31,9 +33,9 @@ struct SqliteStatement {
   }
 };
 
-std::string node_string(const YAML::Node& node, const char* key, std::string fallback = {}) {
+std::string node_string(const YAML::Node& node, const char* key) {
   const auto value = node[key];
-  return value && !value.IsNull() ? value.as<std::string>() : fallback;
+  return value && !value.IsNull() ? value.as<std::string>() : std::string{};
 }
 
 std::uint64_t node_uint64(const YAML::Node& node, const char* key, std::uint64_t fallback = 0) {
@@ -48,28 +50,25 @@ Bytes zstd_bytes(ByteView compressed) {
   if (size == ZSTD_CONTENTSIZE_UNKNOWN) {
     ZSTD_DStream* stream = ZSTD_createDStream();
     if (!stream) throw RosbagsError("cannot create zstd decompressor");
-    const auto cleanup = [&] { ZSTD_freeDStream(stream); };
-    if (ZSTD_isError(ZSTD_initDStream(stream))) {
-      cleanup();
+    const std::unique_ptr<ZSTD_DStream, decltype(&ZSTD_freeDStream)> stream_guard(
+        stream, &ZSTD_freeDStream);
+    if (ZSTD_isError(ZSTD_initDStream(stream)))
       throw FormatError("zstd decompression initialization failed");
-    }
     Bytes output;
     std::array<Byte, 64 * 1024> buffer{};
     ZSTD_inBuffer input{compressed.data, compressed.size, 0};
-    while (input.pos < input.size) {
+    for (;;) {
+      const auto previous_input = input.pos;
       ZSTD_outBuffer destination{buffer.data(), buffer.size(), 0};
       const auto result = ZSTD_decompressStream(stream, &destination, &input);
-      if (ZSTD_isError(result)) {
-        cleanup();
-        throw FormatError("zstd decompression failed");
-      }
+      if (ZSTD_isError(result)) throw FormatError("zstd decompression failed");
       output.insert(output.end(), buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(destination.pos));
-      if (destination.pos == 0 && input.pos == input.size && result != 0) {
-        cleanup();
-        throw FormatError("truncated zstd frame");
+      if (result == 0 && input.pos == input.size) break;
+      if (input.pos == previous_input && destination.pos == 0) {
+        if (input.pos == input.size) throw FormatError("truncated zstd frame");
+        throw FormatError("zstd decompressor made no progress");
       }
     }
-    cleanup();
     return output;
   }
   if (size > std::numeric_limits<std::size_t>::max())
@@ -88,6 +87,8 @@ class SqliteBackend final : public Backend {
     database_.reset();
     connections_.clear();
     topic_to_connection_.clear();
+    definition_digests_.clear();
+    metadata_ = ReaderMetadata{};
     sqlite3* raw = nullptr;
     const auto result = sqlite3_open_v2(path_.c_str(), &raw, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nullptr);
     database_.value = raw;
@@ -305,96 +306,105 @@ class DirectoryBackend final : public Backend {
     if (open_) throw RosbagsError("ROS2 directory reader is already open");
     // A failed open may have left child readers or temporary files behind.
     close();
-    const auto metadata_path = std::filesystem::path(path_) / "metadata.yaml";
-    YAML::Node root;
-    try { root = YAML::LoadFile(metadata_path.string()); }
-    catch (const std::exception& error) { throw FormatError(context(metadata_path.string(), error.what())); }
-    const auto info = root["rosbag2_bagfile_information"];
-    if (!info) throw FormatError(context(metadata_path.string(), "missing rosbag2_bagfile_information"));
-    const auto version = info["version"] ? info["version"].as<int>() : -1;
-    if (version < 0 || version > 9) throw UnsupportedFeature("unsupported rosbag2 metadata version");
-    auto storage = node_string(info, "storage_identifier");
-    std::transform(storage.begin(), storage.end(), storage.begin(), [](unsigned char value) {
-      return static_cast<char>(std::tolower(value));
-    });
-    if (storage != "sqlite3" && storage != "mcap") throw UnsupportedFeature("unsupported rosbag2 storage identifier: " + storage);
-    const auto paths = info["relative_file_paths"];
-    if (!paths || !paths.IsSequence() || paths.size() == 0) throw FormatError("rosbag2 metadata has no relative_file_paths");
-
-    connections_.clear();
-    const auto topics = info["topics_with_message_count"];
-    if (topics && topics.IsSequence()) {
-      std::uint32_t id = 1;
-      for (const auto& item : topics) {
-        const auto topic = item["topic_metadata"];
-        Connection connection;
-        connection.id = id++;
-        connection.topic = normalize_topic(node_string(topic, "name"));
-        connection.type = normalize_type(node_string(topic, "type"));
-        connection.serialization_format = node_string(topic, "serialization_format");
-        connection.message_count = node_uint64(item, "message_count");
-        connection.digest = node_string(topic, "type_description_hash");
-        const auto qos = topic["offered_qos_profiles"];
-        if (qos && qos.IsScalar() && !qos.as<std::string>().empty()) connection.qos_profiles.push_back({qos.as<std::string>()});
-        connections_.push_back(std::move(connection));
+    try {
+      const auto metadata_path = std::filesystem::path(path_) / "metadata.yaml";
+      YAML::Node root;
+      try {
+        root = YAML::LoadFile(metadata_path.string());
+      } catch (const std::exception& error) {
+        throw FormatError(context(metadata_path.string(), error.what()));
       }
-    }
-    compression_mode_ = node_string(info, "compression_mode");
-    compression_format_ = node_string(info, "compression_format");
-    std::transform(compression_mode_.begin(), compression_mode_.end(), compression_mode_.begin(), [](unsigned char value) {
-      return static_cast<char>(std::tolower(value));
-    });
-    std::transform(compression_format_.begin(), compression_format_.end(), compression_format_.begin(), [](unsigned char value) {
-      return static_cast<char>(std::tolower(value));
-    });
-    if (compression_mode_ == "none") compression_mode_.clear();
-    if (!compression_mode_.empty() && compression_mode_ != "file" && compression_mode_ != "message" &&
-        compression_mode_ != "storage")
-      throw UnsupportedFeature("unsupported rosbag2 compression mode: " + compression_mode_);
-    if (!compression_mode_.empty() && compression_format_ != "zstd")
-      throw UnsupportedFeature("unsupported rosbag2 compression format: " + compression_format_);
-    metadata_.storage = storage == "sqlite3" ? StorageKind::Sqlite3 : StorageKind::Mcap;
-    metadata_.message_count = node_uint64(info, "message_count");
-    const auto start = info["starting_time"];
-    metadata_.start_time = start ? node_uint64(start, "nanoseconds_since_epoch") : 0;
-    const auto duration = info["duration"];
-    const auto recorded_duration = duration ? node_uint64(duration, "nanoseconds") : 0;
-    if (metadata_.message_count && recorded_duration == std::numeric_limits<std::uint64_t>::max())
-      throw FormatError("rosbag2 metadata duration overflows end time");
-    metadata_.duration = metadata_.message_count ? recorded_duration + 1 : 0;
-    if (metadata_.start_time > std::numeric_limits<std::uint64_t>::max() - metadata_.duration)
-      throw FormatError("rosbag2 metadata end time overflows uint64_t");
-    metadata_.end_time = metadata_.start_time + metadata_.duration;
-    if (!metadata_.message_count) metadata_.start_time = metadata_.end_time = 0;
-    metadata_.compression_mode = compression_mode_;
-    metadata_.compression_format = compression_format_;
-    metadata_.files.clear();
+      const auto info = root["rosbag2_bagfile_information"];
+      if (!info) throw FormatError(context(metadata_path.string(), "missing rosbag2_bagfile_information"));
+      const auto version = info["version"] ? info["version"].as<int>() : -1;
+      if (version < 0 || version > 9) throw UnsupportedFeature("unsupported rosbag2 metadata version");
+      auto storage = node_string(info, "storage_identifier");
+      std::transform(storage.begin(), storage.end(), storage.begin(),
+                     [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+      if (storage != "sqlite3" && storage != "mcap")
+        throw UnsupportedFeature("unsupported rosbag2 storage identifier: " + storage);
+      const auto paths = info["relative_file_paths"];
+      if (!paths || !paths.IsSequence() || paths.size() == 0)
+        throw FormatError("rosbag2 metadata has no relative_file_paths");
 
-    for (const auto& item : paths) {
-      const auto relative = std::filesystem::path(item.as<std::string>());
-      if (relative.empty() || relative.is_absolute()) throw FormatError("rosbag2 relative_file_paths contains an invalid path");
-      // Match rosbag2's storage convention: metadata paths are basenames.
-      const auto input = std::filesystem::path(path_) / relative.filename();
-      if (!std::filesystem::exists(input)) throw FormatError(context(input.string(), "storage file is missing"));
-      std::string actual = input.string();
-      if (compression_mode_ == "file") actual = decompress_file(input);
-      auto backend = storage == "sqlite3" ? make_sqlite_backend(actual) : make_mcap_backend(actual);
-      backend->open();
-      backends_.push_back(std::move(backend));
-      metadata_.files.push_back(actual);
-    }
-    for (auto& connection : connections_) {
-      for (const auto& backend : backends_) {
-        const auto it = std::find_if(backend->connections().begin(), backend->connections().end(), [&](const auto& candidate) {
-          return candidate.topic == connection.topic && candidate.type == connection.type;
-        });
-        if (it != backend->connections().end() && it->definition.format != DefinitionFormat::None) {
-          connection.definition = it->definition;
-          break;
+      connections_.clear();
+      const auto topics = info["topics_with_message_count"];
+      if (topics && topics.IsSequence()) {
+        std::uint32_t id = 1;
+        for (const auto& item : topics) {
+          const auto topic = item["topic_metadata"];
+          Connection connection;
+          connection.id = id++;
+          connection.topic = normalize_topic(node_string(topic, "name"));
+          connection.type = normalize_type(node_string(topic, "type"));
+          connection.serialization_format = node_string(topic, "serialization_format");
+          connection.message_count = node_uint64(item, "message_count");
+          connection.digest = node_string(topic, "type_description_hash");
+          const auto qos = topic["offered_qos_profiles"];
+          if (qos && qos.IsScalar() && !qos.as<std::string>().empty())
+            connection.qos_profiles.push_back({qos.as<std::string>()});
+          connections_.push_back(std::move(connection));
         }
       }
+      compression_mode_ = node_string(info, "compression_mode");
+      compression_format_ = node_string(info, "compression_format");
+      std::transform(compression_mode_.begin(), compression_mode_.end(), compression_mode_.begin(),
+                     [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+      std::transform(compression_format_.begin(), compression_format_.end(), compression_format_.begin(),
+                     [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+      if (compression_mode_ == "none") compression_mode_.clear();
+      if (!compression_mode_.empty() && compression_mode_ != "file" && compression_mode_ != "message")
+        throw UnsupportedFeature("unsupported rosbag2 compression mode: " + compression_mode_);
+      if (!compression_mode_.empty() && compression_format_ != "zstd")
+        throw UnsupportedFeature("unsupported rosbag2 compression format: " + compression_format_);
+      metadata_.storage = storage == "sqlite3" ? StorageKind::Sqlite3 : StorageKind::Mcap;
+      metadata_.message_count = node_uint64(info, "message_count");
+      const auto start = info["starting_time"];
+      metadata_.start_time = start ? node_uint64(start, "nanoseconds_since_epoch") : 0;
+      const auto duration = info["duration"];
+      const auto recorded_duration = duration ? node_uint64(duration, "nanoseconds") : 0;
+      if (metadata_.message_count && recorded_duration == std::numeric_limits<std::uint64_t>::max())
+        throw FormatError("rosbag2 metadata duration overflows end time");
+      metadata_.duration = metadata_.message_count ? recorded_duration + 1 : 0;
+      if (metadata_.start_time > std::numeric_limits<std::uint64_t>::max() - metadata_.duration)
+        throw FormatError("rosbag2 metadata end time overflows uint64_t");
+      metadata_.end_time = metadata_.start_time + metadata_.duration;
+      if (!metadata_.message_count) metadata_.start_time = metadata_.end_time = 0;
+      metadata_.compression_mode = compression_mode_;
+      metadata_.compression_format = compression_format_;
+      metadata_.files.clear();
+
+      for (const auto& item : paths) {
+        const auto relative = std::filesystem::path(item.as<std::string>());
+        if (relative.empty() || relative.is_absolute())
+          throw FormatError("rosbag2 relative_file_paths contains an invalid path");
+        // Match rosbag2's storage convention: metadata paths are basenames.
+        const auto input = std::filesystem::path(path_) / relative.filename();
+        if (!std::filesystem::exists(input)) throw FormatError(context(input.string(), "storage file is missing"));
+        std::string actual = input.string();
+        if (compression_mode_ == "file") actual = decompress_file(input);
+        auto backend = storage == "sqlite3" ? make_sqlite_backend(actual) : make_mcap_backend(actual);
+        backend->open();
+        backends_.push_back(std::move(backend));
+        metadata_.files.push_back(actual);
+      }
+      for (auto& connection : connections_) {
+        for (const auto& backend : backends_) {
+          const auto it =
+              std::find_if(backend->connections().begin(), backend->connections().end(), [&](const auto& candidate) {
+                return candidate.topic == connection.topic && candidate.type == connection.type;
+              });
+          if (it != backend->connections().end() && it->definition.format != DefinitionFormat::None) {
+            connection.definition = it->definition;
+            break;
+          }
+        }
+      }
+      open_ = true;
+    } catch (...) {
+      close_impl();
+      throw;
     }
-    open_ = true;
   }
   void close() noexcept override { close_impl(); }
   bool is_open() const noexcept override { return open_; }
@@ -430,14 +440,41 @@ class DirectoryBackend final : public Backend {
   std::string decompress_file(const std::filesystem::path& input) {
     const auto compressed = read_file(input);
     const auto bytes = zstd_bytes(ByteView{compressed.data(), compressed.size()});
-    const auto unique = std::hash<std::string>{}(path_ + input.string());
-    const auto output = (std::filesystem::temp_directory_path() /
-                         ("rosbags_cpp_" + std::to_string(unique) + "_" + input.filename().string())).string();
-    std::ofstream file(output, std::ios::binary);
-    if (!file) throw RosbagsError(context(output, "cannot create decompressed storage file"));
-    file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    temporary_files_.push_back(output);
-    return output;
+    auto pattern = (std::filesystem::temp_directory_path() / "rosbags_cpp_XXXXXX").string();
+    std::vector<char> buffer(pattern.begin(), pattern.end());
+    buffer.push_back('\0');
+    int descriptor = ::mkstemp(buffer.data());
+    if (descriptor < 0)
+      throw RosbagsError(context(pattern, std::string("cannot create temporary file: ") + std::strerror(errno)));
+    const std::string output(buffer.data());
+    try {
+      std::size_t offset = 0;
+      while (offset < bytes.size()) {
+        const auto remaining = std::min(
+            bytes.size() - offset,
+            static_cast<std::size_t>(std::numeric_limits<ssize_t>::max()));
+        const auto count = ::write(descriptor, bytes.data() + offset, remaining);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0)
+          throw RosbagsError(context(output, std::string("cannot write decompressed storage file: ") +
+                                               std::strerror(errno)));
+        if (count == 0)
+          throw RosbagsError(context(output, "cannot write decompressed storage file: wrote zero bytes"));
+        offset += static_cast<std::size_t>(count);
+      }
+      if (::close(descriptor) != 0) {
+        descriptor = -1;
+        throw RosbagsError(context(output, std::string("cannot close decompressed storage file: ") +
+                                             std::strerror(errno)));
+      }
+      descriptor = -1;
+      temporary_files_.push_back(output);
+      return output;
+    } catch (...) {
+      if (descriptor >= 0) ::close(descriptor);
+      std::remove(output.c_str());
+      throw;
+    }
   }
   void ensure_open() const { if (!open_) throw RosbagsError("ROS2 directory reader is not open"); }
 

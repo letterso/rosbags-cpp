@@ -156,11 +156,11 @@ struct TypeSupport final : TypeSupportBase {
   CdrDecoder cdr_decoder;
   std::function<std::string(const T&)> formatter;
 
-  TypeSupport(std::string name, std::string profile, Ros1Decoder ros1, CdrDecoder cdr,
+  TypeSupport(std::string name, std::string profile_name, Ros1Decoder ros1, CdrDecoder cdr,
               std::function<std::string(const T&)> format = {})
       : ros1_decoder(std::move(ros1)), cdr_decoder(std::move(cdr)), formatter(std::move(format)) {
     type_name = std::move(name);
-    this->profile = std::move(profile);
+    profile = std::move(profile_name);
     cpp_type = typeid(T);
   }
   std::shared_ptr<void> deserialize_ros1(ByteView data) const override {
@@ -179,6 +179,8 @@ class TypeRegistry {
  public:
   template <typename T>
   void register_type(std::shared_ptr<const TypeSupport<T>> support) {
+    if (!support || support->type_name.empty() || support->profile.empty())
+      throw RosbagsError("invalid type support");
     supports_[key(support->profile, support->type_name)] = std::move(support);
   }
   void register_type(std::shared_ptr<const TypeSupportBase> support);
@@ -200,7 +202,7 @@ struct DecodedMessage {
   bool raw_only() const noexcept { return support == nullptr; }
   template <typename T>
   const T& as() const {
-    if (!support || support->cpp_type != typeid(T)) throw DecodeError("decoded type mismatch");
+    if (!support || !object || support->cpp_type != typeid(T)) throw DecodeError("decoded type mismatch");
     return *static_cast<const T*>(object.get());
   }
 };

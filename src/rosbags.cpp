@@ -135,7 +135,11 @@ void AnyReader::read_raw(const ReadFilter& filter, const MessageCallback& callba
   std::vector<Message> all;
   std::size_t global_index = 0;
   for (const auto& reader : readers_) {
-    const auto local_count = reader->connections().size();
+    const auto& local_connections = reader->connections();
+    const auto local_count = local_connections.size();
+    std::unordered_map<const Connection*, std::size_t> local_positions;
+    local_positions.reserve(local_count);
+    for (std::size_t i = 0; i < local_count; ++i) local_positions.emplace(&local_connections[i], i);
     ReadFilter local = filter;
     local.connection_ids.clear();
     if (!filter.connection_ids.empty()) {
@@ -143,7 +147,7 @@ void AnyReader::read_raw(const ReadFilter& filter, const MessageCallback& callba
         const auto global_id = connections_[global_index + i].id;
         if (std::find(filter.connection_ids.begin(), filter.connection_ids.end(), global_id) !=
             filter.connection_ids.end())
-          local.connection_ids.push_back(reader->connections()[i].id);
+          local.connection_ids.push_back(local_connections[i].id);
       }
       if (local.connection_ids.empty()) {
         global_index += local_count;
@@ -151,12 +155,10 @@ void AnyReader::read_raw(const ReadFilter& filter, const MessageCallback& callba
       }
     }
     reader->read_raw(local, [&](const Message& message) {
-      const auto* local_connection = message.connection;
-      const auto local_pos = static_cast<std::size_t>(
-          std::distance(reader->connections().data(), local_connection));
-      if (local_pos >= local_count) throw RosbagsError("backend returned unknown connection");
+      const auto position = local_positions.find(message.connection);
+      if (position == local_positions.end()) throw RosbagsError("backend returned unknown connection");
       auto copy = message;
-      copy.connection = &connections_[global_index + local_pos];
+      copy.connection = &connections_[global_index + position->second];
       all.push_back(std::move(copy));
     });
     global_index += local_count;

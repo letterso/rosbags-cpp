@@ -28,7 +28,7 @@ if(ROSBAGS_ENABLE_CPPCHECK)
   # vendored doctest, FetchContent dependencies, tests, or the Python subtree.
   add_custom_target(rosbags_cpp_cppcheck
     COMMAND "${ROSBAGS_CPPCHECK_EXECUTABLE}"
-      --enable=warning
+      --enable=warning,performance,portability
       --error-exitcode=2
       --inline-suppr
       --std=c++17

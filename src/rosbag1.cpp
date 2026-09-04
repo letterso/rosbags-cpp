@@ -95,6 +95,8 @@ Bytes decompress_lz4(ByteView compressed) {
   LZ4F_dctx* context = nullptr;
   const auto code = LZ4F_createDecompressionContext(&context, LZ4F_VERSION);
   if (LZ4F_isError(code)) throw FormatError("cannot create LZ4 decompressor");
+  const std::unique_ptr<LZ4F_dctx, decltype(&LZ4F_freeDecompressionContext)> context_guard(
+      context, &LZ4F_freeDecompressionContext);
   std::vector<Byte> output;
   std::array<Byte, 64 * 1024> buffer{};
   std::size_t source_pos = 0;
@@ -104,22 +106,16 @@ Bytes decompress_lz4(ByteView compressed) {
     std::size_t destination_size = buffer.size();
     const auto result = LZ4F_decompress(context, buffer.data(), &destination_size,
                                         compressed.data + source_pos, &source_size, nullptr);
-    if (LZ4F_isError(result)) {
-      LZ4F_freeDecompressionContext(context);
-      throw FormatError("LZ4 decompression failed");
-    }
+    if (LZ4F_isError(result)) throw FormatError("LZ4 decompression failed");
     output.insert(output.end(), buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(destination_size));
     source_pos += source_size;
     if (result == 0) {
       finished = true;
       break;
     }
-    if (source_size == 0 && destination_size == 0) {
-      LZ4F_freeDecompressionContext(context);
+    if (source_size == 0 && destination_size == 0)
       throw FormatError("LZ4 decompressor made no progress");
-    }
   }
-  LZ4F_freeDecompressionContext(context);
   if (!finished) throw FormatError("truncated LZ4 compressed chunk");
   return output;
 }
@@ -174,6 +170,7 @@ class Rosbag1Backend final : public Backend {
   explicit Rosbag1Backend(std::string path) : path_(std::move(path)) {}
   void open() override {
     if (open_) throw RosbagsError("ROS1 reader is already open");
+    order_ = 0;
     data_ = read_file(path_);
     ByteView view{data_.data(), data_.size()};
     const auto magic_end = std::find(data_.begin(), data_.end(), static_cast<Byte>('\n'));
@@ -277,7 +274,8 @@ class Rosbag1Backend final : public Backend {
   void close() noexcept override {
     open_ = false;
     data_.clear();
-    decompressed_.clear();
+    cached_chunk_.clear();
+    cached_chunk_position_.reset();
   }
   bool is_open() const noexcept override { return open_; }
   StorageKind kind() const override { return StorageKind::Rosbag1; }
@@ -295,12 +293,13 @@ class Rosbag1Backend final : public Backend {
     }
     std::stable_sort(entries.begin(), entries.end(), [](const auto* a, const auto* b) { return a->timestamp < b->timestamp; });
     for (const auto* entry : entries) {
-      auto& chunk = decompressed_[entry->chunk_position];
-      if (chunk.empty()) {
+      if (!cached_chunk_position_ || *cached_chunk_position_ != entry->chunk_position) {
         const auto& header = chunks_.at(entry->chunk_position);
-        chunk = decompress_chunk(header.compression, ByteView{data_.data() + header.data_position, header.data_size});
+        cached_chunk_ = decompress_chunk(
+            header.compression, ByteView{data_.data() + header.data_position, header.data_size});
+        cached_chunk_position_ = entry->chunk_position;
       }
-      ByteView chunk_view{chunk.data(), chunk.size()};
+      ByteView chunk_view{cached_chunk_.data(), cached_chunk_.size()};
       std::size_t position = entry->offset;
       Record record = read_record(chunk_view, position);
       while (field_u8(record.header.fields, "op") == 7) record = read_record(chunk_view, position);
@@ -336,7 +335,8 @@ class Rosbag1Backend final : public Backend {
 
   std::string path_;
   mutable Bytes data_;
-  mutable std::unordered_map<std::uint64_t, Bytes> decompressed_;
+  mutable Bytes cached_chunk_;
+  mutable std::optional<std::uint64_t> cached_chunk_position_;
   std::vector<Connection> connections_;
   std::vector<ChunkInfo> chunk_infos_;
   std::unordered_map<std::uint64_t, Chunk> chunks_;

@@ -56,7 +56,7 @@ cmake -S . -B build-mcap \
 ```bash
 cmake -S . -B build-mcap \
   -DROSBAGS_MCAP_BUILDER_REPOSITORY=https://github.com/olympus-robotics/mcap_builder.git \
-  -DROSBAGS_MCAP_BUILDER_TAG=main
+  -DROSBAGS_MCAP_BUILDER_TAG=d6f3662b7204341797eaeca5ff97b8f659d02bda
 ```
 
 `mcap_builder` 使用 CMake config package 查找 LZ4 和 zstd，而 Ubuntu 的
@@ -84,7 +84,7 @@ cmake -S . -B build_cppcheck \
 cmake --build build_cppcheck --target rosbags_cpp_cppcheck
 ```
 
-该目标只将本工程的库和 CLI 生产实现（`src/*.cpp`、`tools/*.cpp`）传给cppcheck；不会扫描 `tests/`、`tests/third_party/`、`rosbags/` Python 子仓库、构建目录或 FetchContent 的 MCAP 源码。检查包含 warning 级规则，发现问题时目标以非零状态退出。
+该目标只将本工程的库和 CLI 生产实现（`src/*.cpp`、`tools/*.cpp`）传给cppcheck；不会扫描 `tests/`、`tests/third_party/`、`rosbags/` Python 子仓库、构建目录或 FetchContent 的 MCAP 源码。检查包含 warning、performance 和 portability 级规则，发现问题时目标以非零状态退出。
 
 ### 1.4 安装和下游工程
 

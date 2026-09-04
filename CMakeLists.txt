@@ -11,7 +11,7 @@ option(ROSBAGS_ENABLE_MCAP "Enable MCAP backend and fetch/build MCAP when unavai
 option(ROSBAGS_ENABLE_BZ2 "Build BZ2 support when the development library is available" ON)
 set(ROSBAGS_MCAP_ROOT "" CACHE PATH "Optional prefix containing the official MCAP C++ SDK")
 set(ROSBAGS_MCAP_BUILDER_REPOSITORY "https://github.com/olympus-robotics/mcap_builder.git" CACHE STRING "MCAP CMake builder repository")
-set(ROSBAGS_MCAP_BUILDER_TAG "main" CACHE STRING "MCAP CMake builder git tag, branch, or commit")
+set(ROSBAGS_MCAP_BUILDER_TAG "d6f3662b7204341797eaeca5ff97b8f659d02bda" CACHE STRING "MCAP CMake builder git tag, branch, or commit")
 
 if(ROSBAGS_ENABLE_MCAP AND CMAKE_VERSION VERSION_LESS 3.22.1)
   message(FATAL_ERROR "ROSBAGS_ENABLE_MCAP requires CMake 3.22.1 or newer for the mcap_builder FetchContent workflow")
@@ -81,7 +81,6 @@ if(ROSBAGS_ENABLE_MCAP)
       mcap_builder
       GIT_REPOSITORY "${ROSBAGS_MCAP_BUILDER_REPOSITORY}"
       GIT_TAG "${ROSBAGS_MCAP_BUILDER_TAG}"
-      GIT_SHALLOW TRUE
     )
     FetchContent_MakeAvailable(mcap_builder)
     if(TARGET mcap::mcap OR TARGET mcap)
@@ -129,15 +128,22 @@ target_compile_definitions(rosbags_cpp
   PUBLIC ROSBAGS_HAS_BZ2=$<BOOL:${ROSBAGS_HAS_BZ2}>
          ROSBAGS_HAS_MCAP=$<BOOL:${ROSBAGS_HAS_MCAP}>
 )
-target_compile_options(rosbags_cpp PRIVATE -Wall -Wextra -Wpedantic)
+
+function(rosbags_enable_warnings target)
+  target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+endfunction()
+rosbags_enable_warnings(rosbags_cpp)
 
 if(ROSBAGS_BUILD_TOOLS)
   add_executable(rosbags-info tools/rosbags_info.cpp)
   target_link_libraries(rosbags-info PRIVATE rosbags_cpp)
+  rosbags_enable_warnings(rosbags-info)
   add_executable(rosbags-read tools/rosbags_read.cpp)
   target_link_libraries(rosbags-read PRIVATE rosbags_cpp)
+  rosbags_enable_warnings(rosbags-read)
   add_executable(rosbags-gen tools/rosbags_gen.cpp)
   target_link_libraries(rosbags-gen PRIVATE rosbags_cpp)
+  rosbags_enable_warnings(rosbags-gen)
 endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Cppcheck.cmake")
@@ -149,8 +155,35 @@ if(ROSBAGS_BUILD_TESTS)
   add_executable(rosbags_cpp_tests tests/test_main.cpp tests/test_project.cpp)
   target_include_directories(rosbags_cpp_tests PRIVATE "${ROSBAGS_DOCTEST_INCLUDE_DIR}")
   target_link_libraries(rosbags_cpp_tests PRIVATE rosbags_cpp)
-  target_compile_options(rosbags_cpp_tests PRIVATE -Wall -Wextra -Wpedantic)
+  rosbags_enable_warnings(rosbags_cpp_tests)
   add_test(NAME rosbags_cpp_project_tests COMMAND rosbags_cpp_tests)
+
+  if(ROSBAGS_BUILD_TOOLS)
+    set(ROSBAGS_CODEGEN_TEST_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated_test")
+    set(ROSBAGS_CODEGEN_TEST_MESSAGES "${ROSBAGS_CODEGEN_TEST_DIR}/ros2_humble_messages.hpp")
+    set(ROSBAGS_CODEGEN_TEST_REGISTRY "${ROSBAGS_CODEGEN_TEST_DIR}/ros2_humble_registry.hpp")
+    add_custom_command(
+      OUTPUT "${ROSBAGS_CODEGEN_TEST_MESSAGES}" "${ROSBAGS_CODEGEN_TEST_REGISTRY}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory "${ROSBAGS_CODEGEN_TEST_DIR}"
+      COMMAND $<TARGET_FILE:rosbags-gen>
+        --profile ros2_humble
+        --input "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/dependencies"
+        --output "${ROSBAGS_CODEGEN_TEST_DIR}"
+      DEPENDS rosbags-gen
+        tests/data/dependencies/msg/AEnvelope.msg
+        tests/data/dependencies/msg/ZPayload.msg
+      VERBATIM
+    )
+    add_executable(rosbags_codegen_compile_test
+      tests/test_codegen_compile.cpp
+      "${ROSBAGS_CODEGEN_TEST_MESSAGES}"
+      "${ROSBAGS_CODEGEN_TEST_REGISTRY}"
+    )
+    target_include_directories(rosbags_codegen_compile_test PRIVATE "${ROSBAGS_CODEGEN_TEST_DIR}")
+    target_link_libraries(rosbags_codegen_compile_test PRIVATE rosbags_cpp)
+    rosbags_enable_warnings(rosbags_codegen_compile_test)
+    add_test(NAME rosbags_cpp_codegen_compile_test COMMAND rosbags_codegen_compile_test)
+  endif()
 endif()
 
 install(TARGETS rosbags_cpp EXPORT rosbags_cppTargets

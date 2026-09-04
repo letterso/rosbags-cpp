@@ -34,7 +34,7 @@ class ReaderBase {
   explicit ReaderBase(ByteView bytes) : bytes_(bytes) {}
   std::size_t position() const noexcept { return position_; }
   std::size_t remaining() const noexcept { return bytes_.size - position_; }
-  void require(std::size_t size) {
+  void require(std::size_t size) const {
     if (size > bytes_.size - position_) throw DecodeError("serialized message is truncated");
   }
   ByteView read_bytes(std::size_t size) {

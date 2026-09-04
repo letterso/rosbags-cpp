@@ -5,6 +5,7 @@
 #include <rosbags/codegen.hpp>
 
 #include <sqlite3.h>
+#include <zstd.h>
 
 #include <cstdint>
 #include <filesystem>
@@ -161,6 +162,86 @@ TEST_CASE("reads ROS2 directory metadata and decoded messages" * doctest::test_s
   std::filesystem::remove_all(directory);
 }
 
+TEST_CASE("rejects truncated unknown-size zstd message frames" * doctest::test_suite("project")) {
+  const auto directory = temp_path("_zstd_ros2");
+  std::filesystem::remove_all(directory);
+  std::filesystem::create_directories(directory);
+  const auto path = directory / "bag_0.db3";
+
+  Bytes payload(128 * 1024, 0x5a);
+  std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)> context(ZSTD_createCCtx(), &ZSTD_freeCCtx);
+  REQUIRE(context != nullptr);
+  REQUIRE(!ZSTD_isError(ZSTD_CCtx_setParameter(context.get(), ZSTD_c_contentSizeFlag, 0)));
+  Bytes compressed(ZSTD_compressBound(payload.size()));
+  const auto compressed_size = ZSTD_compress2(
+      context.get(), compressed.data(), compressed.size(), payload.data(), payload.size());
+  REQUIRE(!ZSTD_isError(compressed_size));
+  compressed.resize(compressed_size);
+  REQUIRE(ZSTD_getFrameContentSize(compressed.data(), compressed.size()) == ZSTD_CONTENTSIZE_UNKNOWN);
+
+  sqlite3* database = nullptr;
+  REQUIRE(sqlite3_open(path.c_str(), &database) == SQLITE_OK);
+  const char* schema =
+      "CREATE TABLE schema(schema_version INTEGER PRIMARY KEY, ros_distro TEXT NOT NULL);"
+      "INSERT INTO schema VALUES(4,'test');"
+      "CREATE TABLE topics(id INTEGER PRIMARY KEY,name TEXT NOT NULL,type TEXT NOT NULL,serialization_format TEXT NOT NULL,offered_qos_profiles TEXT NOT NULL,type_description_hash TEXT NOT NULL);"
+      "CREATE TABLE messages(id INTEGER PRIMARY KEY,topic_id INTEGER NOT NULL,timestamp INTEGER NOT NULL,data BLOB NOT NULL);"
+      "INSERT INTO topics VALUES(1,'/compressed','test_msgs/msg/Bytes','cdr','','');";
+  REQUIRE(sqlite3_exec(database, schema, nullptr, nullptr, nullptr) == SQLITE_OK);
+  sqlite3_stmt* insert = nullptr;
+  REQUIRE(sqlite3_prepare_v2(database, "INSERT INTO messages VALUES(1,1,42,?)", -1, &insert, nullptr) ==
+          SQLITE_OK);
+  REQUIRE(sqlite3_bind_blob(insert, 1, compressed.data(), static_cast<int>(compressed.size()), SQLITE_TRANSIENT) ==
+          SQLITE_OK);
+  REQUIRE(sqlite3_step(insert) == SQLITE_DONE);
+  sqlite3_finalize(insert);
+  sqlite3_close(database);
+
+  std::ofstream metadata(directory / "metadata.yaml");
+  metadata << "rosbag2_bagfile_information:\n"
+           << "  version: 5\n"
+           << "  storage_identifier: sqlite3\n"
+           << "  relative_file_paths: [bag_0.db3]\n"
+           << "  duration: {nanoseconds: 0}\n"
+           << "  starting_time: {nanoseconds_since_epoch: 42}\n"
+           << "  message_count: 1\n"
+           << "  compression_format: zstd\n"
+           << "  compression_mode: message\n"
+           << "  topics_with_message_count:\n"
+           << "    - topic_metadata:\n"
+           << "        name: /compressed\n"
+           << "        type: test_msgs/msg/Bytes\n"
+           << "        serialization_format: cdr\n"
+           << "      message_count: 1\n";
+  metadata.close();
+
+  rosbags::Reader reader(directory.string());
+  reader.open();
+  std::size_t count = 0;
+  reader.read_raw({}, [&](const rosbags::Message& message) {
+    REQUIRE(message.bytes != nullptr);
+    CHECK(*message.bytes == payload);
+    ++count;
+  });
+  CHECK(count == 1);
+  reader.close();
+
+  compressed.pop_back();
+  REQUIRE(sqlite3_open(path.c_str(), &database) == SQLITE_OK);
+  sqlite3_stmt* update = nullptr;
+  REQUIRE(sqlite3_prepare_v2(database, "UPDATE messages SET data=? WHERE id=1", -1, &update, nullptr) == SQLITE_OK);
+  REQUIRE(sqlite3_bind_blob(update, 1, compressed.data(), static_cast<int>(compressed.size()), SQLITE_TRANSIENT) ==
+          SQLITE_OK);
+  REQUIRE(sqlite3_step(update) == SQLITE_DONE);
+  sqlite3_finalize(update);
+  sqlite3_close(database);
+
+  reader.open();
+  CHECK_THROWS_AS(reader.read_raw({}, [](const rosbags::Message&) {}), rosbags::FormatError);
+  reader.close();
+  std::filesystem::remove_all(directory);
+}
+
 TEST_CASE("reads ROS1 bag chunks and indexes" * doctest::test_suite("project")) {
   const auto path = temp_path(".bag");
   Bytes chunk;
@@ -195,10 +276,10 @@ TEST_CASE("reads ROS1 bag chunks and indexes" * doctest::test_suite("project")) 
   REQUIRE(reader.connections().size() == 1);
   CHECK(reader.connections()[0].topic == "/c");
   std::size_t count = 0;
-  reader.read_raw({}, [&](const rosbags::Message& message) {
-    CHECK(message.timestamp == 1000000002ULL);
-    REQUIRE(message.bytes != nullptr);
-    CHECK(message.bytes->size() == 4);
+  reader.read_raw({}, [&](const rosbags::Message& output_message) {
+    CHECK(output_message.timestamp == 1000000002ULL);
+    REQUIRE(output_message.bytes != nullptr);
+    CHECK(output_message.bytes->size() == 4);
     ++count;
   });
   CHECK(count == 1);
@@ -266,6 +347,10 @@ TEST_CASE("decodes built-in profiles and handles unknown types" * doctest::test_
 }
 
 TEST_CASE("registers ROS1 and ROS2 built-in message packages" * doctest::test_suite("project")) {
+  rosbags::TypeRegistry invalid;
+  std::shared_ptr<const rosbags::TypeSupport<rosbags::profiles::String>> null_support;
+  CHECK_THROWS_AS(invalid.register_type(null_support), rosbags::RosbagsError);
+
   rosbags::TypeRegistry ros1;
   rosbags::profiles::register_builtin_types(ros1, "ros1_noetic");
   CHECK(ros1.find("ros1_noetic", "std_msgs/Bool") != nullptr);

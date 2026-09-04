@@ -139,7 +139,7 @@ zstd 处理边界：
 
 - `compression_mode: file`：先解压到临时文件，再由 SQLite/MCAP 后端打开；
 - `compression_mode: message`：每条消息读取后解压 payload；
-- `compression_mode: storage`：当前代码保留该模式的元数据，但没有额外的 storage 解压层，需确认子文件本身可被底层后端读取。
+- 其他 compression mode（包括 `storage`）当前会明确拒绝，避免把未解压数据交给底层后端后产生误导性的格式错误。
 
 ### 6.4 MCAP
 
