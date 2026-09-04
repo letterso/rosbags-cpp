@@ -300,7 +300,7 @@ class SqliteBackend final : public Backend {
 class DirectoryBackend final : public Backend {
  public:
   explicit DirectoryBackend(std::string path) : path_(std::move(path)) {}
-  ~DirectoryBackend() override { close(); }
+  ~DirectoryBackend() override { close_impl(); }
   void open() override {
     if (open_) throw RosbagsError("ROS2 directory reader is already open");
     // A failed open may have left child readers or temporary files behind.
@@ -396,13 +396,7 @@ class DirectoryBackend final : public Backend {
     }
     open_ = true;
   }
-  void close() noexcept override {
-    for (auto it = backends_.rbegin(); it != backends_.rend(); ++it) (*it)->close();
-    backends_.clear();
-    for (const auto& file : temporary_files_) std::remove(file.c_str());
-    temporary_files_.clear();
-    open_ = false;
-  }
+  void close() noexcept override { close_impl(); }
   bool is_open() const noexcept override { return open_; }
   StorageKind kind() const override { ensure_open(); return metadata_.storage; }
   const ReaderMetadata& metadata() const override { ensure_open(); return metadata_; }
@@ -426,6 +420,13 @@ class DirectoryBackend final : public Backend {
   }
 
  private:
+  void close_impl() noexcept {
+    for (auto it = backends_.rbegin(); it != backends_.rend(); ++it) (*it)->close();
+    backends_.clear();
+    for (const auto& file : temporary_files_) std::remove(file.c_str());
+    temporary_files_.clear();
+    open_ = false;
+  }
   std::string decompress_file(const std::filesystem::path& input) {
     const auto compressed = read_file(input);
     const auto bytes = zstd_bytes(ByteView{compressed.data(), compressed.size()});
