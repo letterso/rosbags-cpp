@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -51,6 +52,15 @@ Bytes u8(std::uint8_t value) { return Bytes{value}; }
 Bytes u32(std::uint32_t value) { Bytes result; put32(result, value); return result; }
 Bytes u64(std::uint64_t value) { Bytes result; put64(result, value); return result; }
 Bytes time_value(std::uint32_t sec, std::uint32_t nsec) { Bytes result; put32(result, sec); put32(result, nsec); return result; }
+void put_cdr_string(Bytes& output, std::string_view value) {
+  put32(output, static_cast<std::uint32_t>(value.size() + 1));
+  output.insert(output.end(), value.begin(), value.end());
+  output.push_back(0);
+}
+void align_cdr(Bytes& output, std::size_t alignment) {
+  const auto relative = (output.size() - 4) % alignment;
+  if (relative) output.resize(output.size() + alignment - relative, 0);
+}
 
 std::filesystem::path temp_path(const std::string& suffix) {
   static std::uint32_t counter = 0;
@@ -255,6 +265,83 @@ TEST_CASE("decodes built-in profiles and handles unknown types" * doctest::test_
 
 }
 
+TEST_CASE("registers ROS1 and ROS2 built-in message packages" * doctest::test_suite("project")) {
+  rosbags::TypeRegistry ros1;
+  rosbags::profiles::register_builtin_types(ros1, "ros1_noetic");
+  CHECK(ros1.find("ros1_noetic", "std_msgs/Bool") != nullptr);
+  CHECK(ros1.find("ros1_noetic", "geometry_msgs/Pose") != nullptr);
+  CHECK(ros1.find("ros1_noetic", "sensor_msgs/PointCloud2") != nullptr);
+  CHECK(ros1.find("ros1_noetic", "nav_msgs/Odometry") != nullptr);
+  CHECK(ros1.find("ros1_noetic", "std_msgs/Time") != nullptr);
+
+  rosbags::TypeRegistry foxy;
+  rosbags::profiles::register_builtin_types(foxy, "ros2_foxy");
+  CHECK(foxy.find("ros2_foxy", "std_msgs/Header") != nullptr);
+  CHECK(foxy.find("ros2_foxy", "geometry_msgs/PolygonInstance") == nullptr);
+  CHECK(foxy.find("ros2_foxy", "std_msgs/Time") == nullptr);
+
+  rosbags::TypeRegistry humble;
+  rosbags::profiles::register_builtin_types(humble, "ros2_humble");
+  CHECK(humble.find("ros2_humble", "geometry_msgs/PolygonInstance") != nullptr);
+  CHECK(humble.find("ros2_humble", "geometry_msgs/VelocityStamped") != nullptr);
+  CHECK(humble.find("ros2_humble", "sensor_msgs/Image") != nullptr);
+  CHECK(humble.find("ros2_humble", "nav_msgs/Path") != nullptr);
+}
+
+TEST_CASE("decodes profile-specific Header and CDR sensor messages" * doctest::test_suite("project")) {
+  rosbags::TypeRegistry registry;
+  rosbags::profiles::register_builtin_types(registry, "ros1_noetic");
+  rosbags::Connection header_connection;
+  header_connection.type = "std_msgs/Header";
+  header_connection.serialization_format = "ros1";
+  Bytes ros1_header;
+  put32(ros1_header, 19);
+  put32(ros1_header, 3);
+  put32(ros1_header, 4);
+  put32(ros1_header, 6);
+  ros1_header.insert(ros1_header.end(), {'c', 'a', 'm', 'e', 'r', 'a'});
+  rosbags::Message header_message{std::make_shared<Bytes>(ros1_header), 0, &header_connection};
+  const auto header_decoded = rosbags::decode(header_message, registry, "ros1_noetic", rosbags::UnknownTypePolicy::Error);
+  REQUIRE(header_decoded);
+  const auto& decoded_header = header_decoded->as<rosbags::profiles::Header>();
+  CHECK(decoded_header.seq == 19);
+  CHECK(decoded_header.stamp.sec == 3);
+  CHECK(decoded_header.stamp.nanosec == 4);
+  CHECK(decoded_header.frame_id == "camera");
+
+  rosbags::profiles::register_builtin_types(registry, "ros2_humble");
+  rosbags::Connection image_connection;
+  image_connection.type = "sensor_msgs/msg/Image";
+  image_connection.serialization_format = "cdr";
+  Bytes image{0, 1, 0, 0};
+  put32(image, 1);
+  put32(image, 2);
+  put_cdr_string(image, "camera");
+  align_cdr(image, 4);
+  put32(image, 480);
+  put32(image, 640);
+  put_cdr_string(image, "mono8");
+  image.push_back(0);
+  align_cdr(image, 4);
+  put32(image, 640);
+  put32(image, 2);
+  image.insert(image.end(), {11, 22});
+  rosbags::Message image_message{std::make_shared<Bytes>(image), 0, &image_connection};
+  const auto image_decoded = rosbags::decode(image_message, registry, "ros2_humble", rosbags::UnknownTypePolicy::Error);
+  REQUIRE(image_decoded);
+  const auto& decoded_image = image_decoded->as<rosbags::profiles::sensor_msgs::Image>();
+  CHECK(decoded_image.header.frame_id == "camera");
+  CHECK(decoded_image.height == 480);
+  CHECK(decoded_image.width == 640);
+  CHECK(decoded_image.encoding == "mono8");
+  CHECK(decoded_image.step == 640);
+  CHECK((decoded_image.data == std::vector<std::uint8_t>{11, 22}));
+
+  image.push_back(0xff);
+  rosbags::Message trailing_image{std::make_shared<Bytes>(image), 0, &image_connection};
+  CHECK_THROWS_AS(rosbags::decode(trailing_image, registry, "ros2_humble", rosbags::UnknownTypePolicy::Error), rosbags::DecodeError);
+}
+
 TEST_CASE("generates C++ types and registry from message definitions" * doctest::test_suite("project")) {
   const auto output = temp_path("_generated");
   std::filesystem::remove_all(output);
@@ -271,7 +358,28 @@ TEST_CASE("generates C++ types and registry from message definitions" * doctest:
   const std::string text((std::istreambuf_iterator<char>(generated)), std::istreambuf_iterator<char>());
   CHECK(text.find("struct Pair") != std::string::npos);
   CHECK(text.find("deserialize_cdr_simple_msg_Pair") != std::string::npos);
+  CHECK(text.find("using rosbags::profiles::detail::read_ros1") != std::string::npos);
   std::filesystem::remove_all(output);
+
+  const auto builtin_input = temp_path("_builtin_definitions");
+  std::filesystem::create_directories(builtin_input / "demo" / "msg");
+  std::ofstream definition(builtin_input / "demo" / "msg" / "Wrapper.msg");
+  definition << "std_msgs/Header header\ngeometry_msgs/Point point\nsensor_msgs/Image image\nnav_msgs/Path path\n";
+  definition.close();
+  const auto builtin_output = temp_path("_builtin_generated");
+  rosbags::codegen::GenerateOptions builtin_options;
+  builtin_options.profile = "ros2_humble";
+  builtin_options.inputs = {(builtin_input / "demo").string()};
+  builtin_options.output_directory = builtin_output.string();
+  rosbags::codegen::generate(builtin_options);
+  std::ifstream builtin_header(builtin_output / "ros2_humble_messages.hpp");
+  const std::string builtin_text((std::istreambuf_iterator<char>(builtin_header)), std::istreambuf_iterator<char>());
+  CHECK(builtin_text.find("::rosbags::profiles::std_msgs::Header header") != std::string::npos);
+  CHECK(builtin_text.find("::rosbags::profiles::geometry_msgs::Point point") != std::string::npos);
+  CHECK(builtin_text.find("::rosbags::profiles::sensor_msgs::Image image") != std::string::npos);
+  CHECK(builtin_text.find("::rosbags::profiles::nav_msgs::Path path") != std::string::npos);
+  std::filesystem::remove_all(builtin_input);
+  std::filesystem::remove_all(builtin_output);
 
 }
 

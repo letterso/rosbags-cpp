@@ -159,7 +159,9 @@ build/rosbags-read /data/legacy.bag /imu0 --decode ros1_noetic
 build/rosbags-read /data/run_01 /imu0 --decode ros2_humble
 ```
 
-CLI 默认使用 `WarnAndSkip`：未注册类型会写 warning 并跳过，不会伪装成已解码对象。当前内置类型包括 `std_msgs/String`、`std_msgs/Empty`、`builtin_interfaces/Time`、`builtin_interfaces/Duration`、`geometry_msgs/Vector3`、`geometry_msgs/Quaternion` 和 `sensor_msgs/Imu`。
+CLI 默认使用 `WarnAndSkip`：未注册类型会写 warning 并跳过，不会伪装成已解码对象。当前内置 profile 覆盖 `std_msgs`、`geometry_msgs`、`sensor_msgs` 和 `nav_msgs` 的直接消息类型，并提供 `rosbags::profiles::<package>::<Type>` C++ 类型。为兼容旧代码，`String`、`Empty`、`Header`、`Vector3`、`Quaternion` 和 `Imu` 仍可通过 `rosbags::profiles` 的扁平别名访问。
+
+ROS1 `ros1_noetic` 的 `std_msgs/Header` 包含 `seq`；ROS2 CDR 的 Header 按官方定义仅包含 `stamp` 和 `frame_id`。`sensor_msgs/CameraInfo` 同样保留 ROS1 的大写 `D/K/R/P` 与 ROS2 的小写 `d/k/r/p` 字段，读取器会按 profile 选择对应 wire layout。ROS2 Humble/Jazzy 还注册 `geometry_msgs/PolygonInstance`、`PolygonInstanceStamped` 和 `VelocityStamped`；Foxy 不注册这些较新的类型。
 
 ### 3.4 生成自定义类型：`rosbags-gen`
 

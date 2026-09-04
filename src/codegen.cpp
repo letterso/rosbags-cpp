@@ -62,6 +62,9 @@ std::string canonical_type(const std::string& package, const std::string& type) 
 std::string namespace_for(const Definition& definition, std::string_view profile) {
   return "rosbags::generated::" + sanitize(std::string(profile)) + "::" + sanitize(definition.package) + "::msg";
 }
+bool is_builtin_package(std::string_view package) {
+  return package == "std_msgs" || package == "geometry_msgs" || package == "sensor_msgs" || package == "nav_msgs";
+}
 std::string local_type(const Definition& owner, const std::string& type, std::string_view profile) {
   if (is_primitive(type)) return primitive_cpp(type);
   const auto canonical = canonical_type(owner.package, type);
@@ -69,9 +72,14 @@ std::string local_type(const Definition& owner, const std::string& type, std::st
   // legacy sequence field while ROS2 CDR does not. Reuse the profile type and
   // emit the two wire readers below instead of generating one incompatible
   // struct from a single .msg definition.
-  if (canonical == "std_msgs/msg/Header") return "rosbags::profiles::Header";
+  if (canonical == "builtin_interfaces/msg/Time") return "::rosbags::profiles::Time";
+  if (canonical == "builtin_interfaces/msg/Duration") return "::rosbags::profiles::Duration";
   const auto slash = canonical.find("/msg/");
   if (slash == std::string::npos) return "std::string";
+  if (is_builtin_package(canonical.substr(0, slash))) {
+    return "::rosbags::profiles::" + sanitize(canonical.substr(0, slash)) + "::" +
+           sanitize(canonical.substr(slash + 5));
+  }
   return "rosbags::generated::" + sanitize(std::string(profile)) + "::" + sanitize(canonical.substr(0, slash)) + "::msg::" + sanitize(canonical.substr(slash + 5));
 }
 void parse_type_suffix(std::string type, Field& field) {
@@ -254,13 +262,10 @@ void generate(const GenerateOptions& options) {
     header << "};\n";
     header << "}\n";
   }
-  header << "\nnamespace rosbags::generated::" << sanitize(options.profile) << "::detail {\nusing namespace rosbags::serialization;\n";
-  header << "inline void read_ros1(Ros1Reader& reader, rosbags::profiles::Header& value) {\n"
-         << "  (void)reader.u32();\n  value.stamp.sec = reader.i32();\n"
-         << "  value.stamp.nanosec = reader.u32();\n  value.frame_id = reader.string();\n}\n";
-  header << "inline void read_cdr(CdrReader& reader, rosbags::profiles::Header& value) {\n"
-         << "  value.stamp.sec = reader.i32();\n  value.stamp.nanosec = reader.u32();\n"
-         << "  value.frame_id = reader.string();\n}\n";
+  header << "\nnamespace rosbags::generated::" << sanitize(options.profile)
+         << "::detail {\nusing namespace rosbags::serialization;\n"
+         << "using rosbags::profiles::detail::read_ros1;\n"
+         << "using rosbags::profiles::detail::read_cdr;\n";
   for (const auto& definition : definitions) {
     const auto qname = namespace_for(definition, options.profile) + "::" + sanitize(definition.name);
     header << "inline void read_ros1(Ros1Reader&, " << qname << "&); inline void read_cdr(CdrReader&, " << qname << "&);\n";
