@@ -39,6 +39,7 @@ cmake --build build-no-mcap -j2
 ```
 
 工程 C++ 测试使用 vendored 的 doctest v2.5.3 single-header，不链接额外测试库。
+库、CLI 和生成代码测试共用 doctest 入口，由 CTest 调度；测试组织和筛选方法见 [测试说明](../tests/README.md)。
 
 ```bash
 build-no-mcap/rosbags_cpp_tests
@@ -121,7 +122,7 @@ ROS2 目录中的 `relative_file_paths` 必须指向目录内实际存在的存�
 
 ## 3. CLI 使用
 
-所有 CLI 都是一次性命令；参数错误或格式错误会输出 `error: ...` 并返回非零退出码。当前 CLI 没有独立的 `--help` 选项，参数形式如下。
+所有 CLI 都是一次性命令，使用 cxxopts 解析参数。`-h` 或 `--help` 显示帮助并返回 0；参数错误返回 2，读取或生成失败返回 1，并输出 `error: ...`。带值选项同时支持 `--key value` 和 `--key=value`；`--input` 可重复指定，读取命令支持多个 topic。参数形式如下。
 
 ### 3.1 查看摘要：`rosbags-info`
 
