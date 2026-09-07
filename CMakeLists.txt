@@ -144,6 +144,10 @@ if(ROSBAGS_BUILD_TOOLS)
   add_executable(rosbags-gen tools/rosbags_gen.cpp)
   target_link_libraries(rosbags-gen PRIVATE rosbags_cpp)
   rosbags_enable_warnings(rosbags-gen)
+  foreach(tool IN ITEMS rosbags-info rosbags-read rosbags-gen)
+    target_include_directories(${tool} SYSTEM PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/tools/third_party/cxxopts")
+  endforeach()
 endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Cppcheck.cmake")
@@ -152,13 +156,24 @@ if(ROSBAGS_BUILD_TESTS)
   # doctest v2.5.3 is vendored as its official single header.  No doctest
   # library is linked; test_main.cpp provides the header-only implementation.
   set(ROSBAGS_DOCTEST_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tests/third_party")
-  add_executable(rosbags_cpp_tests tests/test_main.cpp tests/test_project.cpp)
-  target_include_directories(rosbags_cpp_tests PRIVATE "${ROSBAGS_DOCTEST_INCLUDE_DIR}")
-  target_link_libraries(rosbags_cpp_tests PRIVATE rosbags_cpp)
-  rosbags_enable_warnings(rosbags_cpp_tests)
-  add_test(NAME rosbags_cpp_project_tests COMMAND rosbags_cpp_tests)
+  function(rosbags_add_test target test_name)
+    add_executable(${target} tests/test_main.cpp ${ARGN})
+    target_include_directories(${target} PRIVATE "${ROSBAGS_DOCTEST_INCLUDE_DIR}")
+    target_link_libraries(${target} PRIVATE rosbags_cpp)
+    rosbags_enable_warnings(${target})
+    add_test(NAME ${test_name} COMMAND ${target})
+    set_tests_properties(${test_name} PROPERTIES TIMEOUT 60)
+  endfunction()
+  rosbags_add_test(rosbags_cpp_tests rosbags_cpp_project_tests tests/test_project.cpp)
 
   if(ROSBAGS_BUILD_TOOLS)
+    rosbags_add_test(rosbags_cli_tests rosbags_cpp_cli_tests tests/test_cli.cpp)
+    target_compile_definitions(rosbags_cli_tests PRIVATE
+      ROSBAGS_INFO_PATH="$<TARGET_FILE:rosbags-info>"
+      ROSBAGS_READ_PATH="$<TARGET_FILE:rosbags-read>"
+      ROSBAGS_GEN_PATH="$<TARGET_FILE:rosbags-gen>"
+      ROSBAGS_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+    add_dependencies(rosbags_cli_tests rosbags-info rosbags-read rosbags-gen)
     set(ROSBAGS_CODEGEN_TEST_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated_test")
     set(ROSBAGS_CODEGEN_TEST_MESSAGES "${ROSBAGS_CODEGEN_TEST_DIR}/ros2_humble_messages.hpp")
     set(ROSBAGS_CODEGEN_TEST_REGISTRY "${ROSBAGS_CODEGEN_TEST_DIR}/ros2_humble_registry.hpp")
@@ -174,15 +189,12 @@ if(ROSBAGS_BUILD_TESTS)
         tests/data/dependencies/msg/ZPayload.msg
       VERBATIM
     )
-    add_executable(rosbags_codegen_compile_test
+    rosbags_add_test(rosbags_codegen_compile_test rosbags_cpp_codegen_compile_test
       tests/test_codegen_compile.cpp
       "${ROSBAGS_CODEGEN_TEST_MESSAGES}"
       "${ROSBAGS_CODEGEN_TEST_REGISTRY}"
     )
     target_include_directories(rosbags_codegen_compile_test PRIVATE "${ROSBAGS_CODEGEN_TEST_DIR}")
-    target_link_libraries(rosbags_codegen_compile_test PRIVATE rosbags_cpp)
-    rosbags_enable_warnings(rosbags_codegen_compile_test)
-    add_test(NAME rosbags_cpp_codegen_compile_test COMMAND rosbags_codegen_compile_test)
   endif()
 endif()
 

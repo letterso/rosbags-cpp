@@ -1,6 +1,7 @@
 #include "ros2_humble_registry.hpp"
+#include <doctest/doctest.h>
 
-int main() {
+TEST_CASE("generated nested types compile and register" * doctest::test_suite("codegen")) {
   using Envelope = rosbags::generated::ros2_humble::dependencies::msg::AEnvelope;
   Envelope value{};
   value.payload.value = 1;
@@ -10,5 +11,6 @@ int main() {
 
   rosbags::TypeRegistry registry;
   rosbags::generated::ros2_humble::register_types(registry);
-  return registry.find("ros2_humble", "dependencies/msg/AEnvelope") ? 0 : 1;
+  CHECK(registry.find("ros2_humble", "dependencies/msg/AEnvelope") != nullptr);
+  CHECK(registry.find("ros2_humble", "dependencies/msg/ZPayload") != nullptr);
 }

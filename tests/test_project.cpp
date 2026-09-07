@@ -1,4 +1,5 @@
 #include <doctest/doctest.h>
+#include "support/temp_directory.hpp"
 
 #include <rosbags/rosbags.hpp>
 #include <rosbags/profiles.hpp>
@@ -66,8 +67,9 @@ void align_cdr(Bytes& output, std::size_t alignment) {
 }
 
 std::filesystem::path temp_path(const std::string& suffix) {
+  static rosbags::test::TempDirectory directory;
   static std::uint32_t counter = 0;
-  return std::filesystem::temp_directory_path() / ("rosbags_cpp_test_" + std::to_string(++counter) + suffix);
+  return directory.path() / (std::to_string(++counter) + suffix);
 }
 
 struct Ros1TestMessage {
