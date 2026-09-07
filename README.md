@@ -22,9 +22,9 @@ build/rosbags-read PATH [TOPIC ...] [--decode PROFILE]
 build/rosbags-gen --profile PROFILE --input DIR_OR_FILE --output DIR
 ```
 
-
 ## 文档
 
 - [落盘方案与程序架构](docs/architecture.md)
 - [具体使用文档：CLI、C++ API 和自定义消息](docs/usage.md)
 - [消息定义输入说明](definitions/README.md)
+- [更新说明](changelog.md)
