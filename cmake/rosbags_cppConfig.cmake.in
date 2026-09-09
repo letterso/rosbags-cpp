@@ -1,5 +1,7 @@
 @PACKAGE_INIT@
 
+set(_rosbags_cpp_prefix "${PACKAGE_PREFIX_DIR}")
+
 include(CMakeFindDependencyMacro)
 find_dependency(SQLite3)
 find_dependency(yaml-cpp)
@@ -9,8 +11,29 @@ pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
 if(@ROSBAGS_HAS_BZ2@)
   find_dependency(BZip2)
 endif()
+include("${CMAKE_CURRENT_LIST_DIR}/lz4Config.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/zstdConfig.cmake")
+if(@ROSBAGS_HAS_MCAP@ AND @ROSBAGS_MCAP_EXTERNAL@ AND NOT TARGET rosbags_cpp::mcap_sdk)
+  find_path(ROSBAGS_MCAP_INCLUDE_DIR mcap/reader.hpp
+    HINTS "${ROSBAGS_MCAP_ROOT}" "${_rosbags_cpp_prefix}" PATH_SUFFIXES include include/mcap_vendor)
+  find_library(ROSBAGS_MCAP_LIBRARY mcap
+    HINTS "${ROSBAGS_MCAP_ROOT}" "${_rosbags_cpp_prefix}" PATH_SUFFIXES lib lib64)
+  if(NOT ROSBAGS_MCAP_INCLUDE_DIR OR NOT ROSBAGS_MCAP_LIBRARY)
+    set(rosbags_cpp_FOUND FALSE)
+    set(rosbags_cpp_NOT_FOUND_MESSAGE "MCAP SDK is required; set ROSBAGS_MCAP_ROOT to its installation prefix")
+    return()
+  endif()
+  add_library(rosbags_cpp::mcap_sdk UNKNOWN IMPORTED)
+  set_target_properties(rosbags_cpp::mcap_sdk PROPERTIES
+    IMPORTED_LOCATION "${ROSBAGS_MCAP_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${ROSBAGS_MCAP_INCLUDE_DIR}"
+    INTERFACE_LINK_LIBRARIES "LZ4::lz4;zstd::libzstd")
+endif()
 if(@ROSBAGS_HAS_MCAP@ AND NOT @ROSBAGS_MCAP_EXTERNAL@)
   find_dependency(mcap CONFIG)
 endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/rosbags_cppTargets.cmake")
+
+include("${CMAKE_CURRENT_LIST_DIR}/rosbagsGenerateMessages.cmake")
+check_required_components(rosbags_cpp)

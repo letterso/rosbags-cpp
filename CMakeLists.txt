@@ -35,6 +35,9 @@ if(ROSBAGS_ENABLE_BZ2)
   endif()
 endif()
 
+include(cmake/lz4Config.cmake.in)
+include(cmake/zstdConfig.cmake.in)
+
 set(ROSBAGS_HAS_MCAP OFF)
 set(ROSBAGS_MCAP_EXTERNAL OFF)
 if(ROSBAGS_ENABLE_MCAP)
@@ -116,8 +119,12 @@ if(ROSBAGS_HAS_BZ2)
 endif()
 if(ROSBAGS_HAS_MCAP)
   if(ROSBAGS_MCAP_EXTERNAL)
-    target_include_directories(rosbags_cpp PUBLIC "${ROSBAGS_MCAP_INCLUDE_DIR}")
-    target_link_libraries(rosbags_cpp PUBLIC "${ROSBAGS_MCAP_LIBRARY}")
+    add_library(rosbags_cpp::mcap_sdk UNKNOWN IMPORTED)
+    set_target_properties(rosbags_cpp::mcap_sdk PROPERTIES
+      IMPORTED_LOCATION "${ROSBAGS_MCAP_LIBRARY}"
+      INTERFACE_INCLUDE_DIRECTORIES "${ROSBAGS_MCAP_INCLUDE_DIR}"
+      INTERFACE_LINK_LIBRARIES "LZ4::lz4;zstd::libzstd")
+    target_link_libraries(rosbags_cpp PRIVATE rosbags_cpp::mcap_sdk)
   elseif(TARGET mcap::mcap)
     target_link_libraries(rosbags_cpp PUBLIC mcap::mcap)
   elseif(TARGET mcap)
@@ -133,6 +140,17 @@ function(rosbags_enable_warnings target)
   target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
 endfunction()
 rosbags_enable_warnings(rosbags_cpp)
+target_compile_features(rosbags_cpp PUBLIC cxx_std_17)
+# mcap_builder installs its library into lib, independently of GNUInstallDirs.
+file(RELATIVE_PATH ROSBAGS_MCAP_LIB_RELATIVE "/${CMAKE_INSTALL_LIBDIR}" "/lib")
+if(APPLE)
+  set_target_properties(rosbags_cpp PROPERTIES
+    INSTALL_RPATH "@loader_path;@loader_path/${ROSBAGS_MCAP_LIB_RELATIVE}")
+elseif(UNIX)
+  set_target_properties(rosbags_cpp PROPERTIES
+    INSTALL_RPATH "$ORIGIN;$ORIGIN/${ROSBAGS_MCAP_LIB_RELATIVE}")
+endif()
+include(cmake/rosbagsGenerateMessages.cmake)
 
 if(ROSBAGS_BUILD_TOOLS)
   add_executable(rosbags-info tools/rosbags_info.cpp)
@@ -142,9 +160,16 @@ if(ROSBAGS_BUILD_TOOLS)
   target_link_libraries(rosbags-read PRIVATE rosbags_cpp)
   rosbags_enable_warnings(rosbags-read)
   add_executable(rosbags-gen tools/rosbags_gen.cpp)
+  add_executable(rosbags_cpp::rosbags-gen ALIAS rosbags-gen)
   target_link_libraries(rosbags-gen PRIVATE rosbags_cpp)
   rosbags_enable_warnings(rosbags-gen)
+  file(RELATIVE_PATH ROSBAGS_BIN_TO_LIB "/${CMAKE_INSTALL_BINDIR}" "/${CMAKE_INSTALL_LIBDIR}")
   foreach(tool IN ITEMS rosbags-info rosbags-read rosbags-gen)
+    if(APPLE)
+      set_target_properties(${tool} PROPERTIES INSTALL_RPATH "@loader_path/${ROSBAGS_BIN_TO_LIB}")
+    elseif(UNIX)
+      set_target_properties(${tool} PROPERTIES INSTALL_RPATH "$ORIGIN/${ROSBAGS_BIN_TO_LIB}")
+    endif()
     target_include_directories(${tool} SYSTEM PRIVATE
       "${CMAKE_CURRENT_SOURCE_DIR}/tools/third_party/cxxopts")
   endforeach()
@@ -165,6 +190,9 @@ if(ROSBAGS_BUILD_TESTS)
     set_tests_properties(${test_name} PROPERTIES TIMEOUT 60)
   endfunction()
   rosbags_add_test(rosbags_cpp_tests rosbags_cpp_project_tests tests/test_project.cpp)
+  if(ROSBAGS_HAS_MCAP AND ROSBAGS_MCAP_EXTERNAL)
+    target_link_libraries(rosbags_cpp_tests PRIVATE rosbags_cpp::mcap_sdk)
+  endif()
 
   if(ROSBAGS_BUILD_TOOLS)
     rosbags_add_test(rosbags_cli_tests rosbags_cpp_cli_tests tests/test_cli.cpp)
@@ -203,6 +231,10 @@ install(TARGETS rosbags_cpp EXPORT rosbags_cppTargets
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
+if(ROSBAGS_BUILD_TOOLS)
+  install(TARGETS rosbags-info rosbags-read rosbags-gen EXPORT rosbags_cppTargets
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT rosbags_cppTargets NAMESPACE rosbags_cpp:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/rosbags_cpp)
 configure_package_config_file(
@@ -215,10 +247,16 @@ write_basic_package_version_file(
   COMPATIBILITY SameMajorVersion
 )
 install(FILES
+  cmake/rosbagsGenerateMessages.cmake
   "${CMAKE_CURRENT_BINARY_DIR}/rosbags_cppConfig.cmake"
   "${CMAKE_CURRENT_BINARY_DIR}/rosbags_cppConfigVersion.cmake"
   DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/rosbags_cpp"
 )
+
+install(FILES cmake/lz4Config.cmake.in
+  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/rosbags_cpp" RENAME lz4Config.cmake)
+install(FILES cmake/zstdConfig.cmake.in
+  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/rosbags_cpp" RENAME zstdConfig.cmake)
 
 message(STATUS "rosbags_cpp MCAP support: ${ROSBAGS_HAS_MCAP}")
 message(STATUS "rosbags_cpp BZ2 support: ${ROSBAGS_HAS_BZ2}")
