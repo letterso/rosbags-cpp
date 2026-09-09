@@ -28,6 +28,7 @@ class McapBackend final : public Backend {
       Connection connection;
       connection.id = channel.id;
       connection.topic = normalize_topic(channel.topic);
+      connection.original_topic = channel.topic;
       connection.serialization_format = channel.messageEncoding;
       const auto schema = schemas_.find(channel.schemaId);
       if (schema != schemas_.end() && schema->second) {
@@ -108,7 +109,7 @@ class McapBackend::Cursor final : public BackendCursor {
       options.topicFilter = [filter = filter_](std::string_view topic) {
         const auto normalized = normalize_topic(topic);
         return std::any_of(filter.topics.begin(), filter.topics.end(), [&](const auto& requested) {
-          return normalize_topic(requested) == normalized;
+          return topics_match(requested, normalized, filter.topic_match, filter.topic_namespace);
         });
       };
     }
@@ -145,7 +146,7 @@ class McapBackend::Cursor final : public BackendCursor {
                                            reinterpret_cast<const Byte*>(message.data) + message.dataSize);
       const auto timestamp = message.logTime;
       ++(*iterator_);
-      output = Message{std::move(bytes), timestamp, &*it};
+      output = Message{std::move(bytes), timestamp, &*it, owner_.path_};
       return true;
     }
     if (problem_) throw FormatError(context(owner_.path_, "MCAP message scan failed: " + problem_->message));

@@ -111,7 +111,7 @@ inline std::vector<Byte> read_file(const std::filesystem::path& path) {
 inline bool has_topic(const Connection& connection, const ReadFilter& filter) {
   if (!filter.topics.empty()) {
     const auto match = std::find_if(filter.topics.begin(), filter.topics.end(), [&](const auto& topic) {
-      return normalize_topic(topic) == connection.topic;
+      return topics_match(topic, connection.topic, filter.topic_match, filter.topic_namespace);
     });
     if (match == filter.topics.end()) return false;
   }

@@ -35,7 +35,7 @@ class ReaderBase {
   std::size_t position() const noexcept { return position_; }
   std::size_t remaining() const noexcept { return bytes_.size - position_; }
   void require(std::size_t size) const {
-    if (size > bytes_.size - position_) throw DecodeError("serialized message is truncated");
+    if (size > bytes_.size - position_) fail("serialized message is truncated");
   }
   ByteView read_bytes(std::size_t size) {
     require(size);
@@ -45,9 +45,16 @@ class ReaderBase {
   }
   void skip(std::size_t size) { (void)read_bytes(size); }
   void finish() const {
-    if (position_ != bytes_.size) throw DecodeError("serialized message has trailing bytes");
+    if (position_ != bytes_.size) fail("serialized message has trailing bytes");
   }
  protected:
+  [[noreturn]] void fail(const char* reason) const {
+    DecodeError error(reason);
+    ErrorContext context;
+    context.byte_offset = position_;
+    error.add_context(context);
+    throw error;
+  }
   ByteView bytes_;
   std::size_t position_ = 0;
 };
@@ -77,8 +84,8 @@ class Ros1Reader final : public ReaderBase {
 class CdrReader final : public ReaderBase {
  public:
   explicit CdrReader(ByteView bytes) : ReaderBase(bytes) {
-    if (bytes.size < 4 || bytes.data[0] != 0) throw DecodeError("invalid CDR encapsulation");
-    if (bytes.data[1] != 0 && bytes.data[1] != 1) throw DecodeError("invalid CDR byte order");
+    if (bytes.size < 4 || bytes.data[0] != 0) fail("invalid CDR encapsulation");
+    if (bytes.data[1] != 0 && bytes.data[1] != 1) fail("invalid CDR byte order");
     little_ = bytes.data[1] == 1;
     position_ = 4;
   }

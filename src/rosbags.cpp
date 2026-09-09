@@ -4,6 +4,30 @@
 
 namespace rosbags {
 
+void RosbagsError::add_context(const ErrorContext& context) {
+#define ROSBAGS_CONTEXT_FIELD(name) if (!context_.name) context_.name = context.name
+  ROSBAGS_CONTEXT_FIELD(source_path);
+  ROSBAGS_CONTEXT_FIELD(connection_id);
+  ROSBAGS_CONTEXT_FIELD(topic);
+  ROSBAGS_CONTEXT_FIELD(type);
+  ROSBAGS_CONTEXT_FIELD(serialization_format);
+  ROSBAGS_CONTEXT_FIELD(timestamp);
+  ROSBAGS_CONTEXT_FIELD(byte_offset);
+#undef ROSBAGS_CONTEXT_FIELD
+  diagnostic_ = reason();
+  if (context_.source_path) diagnostic_ += " [file=" + *context_.source_path + "]";
+  if (context_.connection_id) diagnostic_ += " [connection=" + std::to_string(*context_.connection_id) + "]";
+  if (context_.topic) diagnostic_ += " [topic=" + *context_.topic + "]";
+  if (context_.type) diagnostic_ += " [type=" + *context_.type + "]";
+  if (context_.serialization_format) diagnostic_ += " [format=" + *context_.serialization_format + "]";
+  if (context_.timestamp) diagnostic_ += " [timestamp_ns=" + std::to_string(*context_.timestamp) + "]";
+  if (context_.byte_offset) diagnostic_ += " [byte_offset=" + std::to_string(*context_.byte_offset) + "]";
+}
+
+const char* RosbagsError::what() const noexcept {
+  return diagnostic_.empty() ? reason() : diagnostic_.c_str();
+}
+
 struct MessageCursor::Impl {
   virtual ~Impl() = default;
   virtual bool next(Message& output) = 0;
@@ -13,14 +37,25 @@ namespace {
 
 class BackendCursorImpl final : public MessageCursor::Impl {
  public:
-  BackendCursorImpl(std::shared_ptr<void> owner, std::unique_ptr<internal::BackendCursor> cursor)
-      : owner_(std::move(owner)), cursor_(std::move(cursor)) {}
-  bool next(Message& output) override { return cursor_->next(output); }
+  BackendCursorImpl(std::shared_ptr<void> owner, std::unique_ptr<internal::BackendCursor> cursor,
+                    std::string path)
+      : owner_(std::move(owner)), cursor_(std::move(cursor)), path_(std::move(path)) {}
+  bool next(Message& output) override {
+    try {
+      return cursor_->next(output);
+    } catch (RosbagsError& error) {
+      ErrorContext context;
+      context.source_path = path_;
+      error.add_context(context);
+      throw;
+    }
+  }
 
  private:
   // Keep the backend alive until after its cursor has been destroyed.
   std::shared_ptr<void> owner_;
   std::unique_ptr<internal::BackendCursor> cursor_;
+  std::string path_;
 };
 
 }  // namespace
@@ -154,7 +189,14 @@ Reader& Reader::operator=(Reader&&) noexcept = default;
 
 void Reader::open() {
   if (is_open()) throw RosbagsError("reader is already open");
-  impl_->backend->open();
+  try {
+    impl_->backend->open();
+  } catch (RosbagsError& error) {
+    ErrorContext context;
+    context.source_path = impl_->path;
+    error.add_context(context);
+    throw;
+  }
 }
 
 void Reader::close() noexcept {
@@ -174,8 +216,16 @@ const ReaderMetadata& Reader::metadata() const { return impl_->backend->metadata
 const std::vector<Connection>& Reader::connections() const { return impl_->backend->connections(); }
 MessageCursor Reader::messages(const ReadFilter& filter) const {
   if (!is_open()) throw RosbagsError("reader is not open");
-  auto cursor = impl_->backend->make_cursor(filter);
-  return MessageCursor(std::make_unique<BackendCursorImpl>(impl_, std::move(cursor)));
+  try {
+    (void)topics_match({}, {}, filter.topic_match, filter.topic_namespace);
+    auto cursor = impl_->backend->make_cursor(filter);
+    return MessageCursor(std::make_unique<BackendCursorImpl>(impl_, std::move(cursor), impl_->path));
+  } catch (RosbagsError& error) {
+    ErrorContext context;
+    context.source_path = impl_->path;
+    error.add_context(context);
+    throw;
+  }
 }
 void Reader::read_raw(const ReadFilter& filter, const MessageCallback& callback) const {
   if (!callback) throw RosbagsError("message callback is empty");
@@ -308,13 +358,34 @@ std::vector<std::string> TypeRegistry::types() const {
 std::optional<DecodedMessage> decode(const Message& message, const TypeRegistry& registry,
                                      std::string_view profile, UnknownTypePolicy policy,
                                      const WarningCallback& warning) {
-  if (!message.connection || !message.bytes) throw DecodeError("message has no connection/data");
+  const auto message_context = [&]() {
+    ErrorContext context;
+    if (!message.source_path.empty()) context.source_path = message.source_path;
+    context.timestamp = message.timestamp;
+    if (message.connection) {
+      context.connection_id = message.connection->id;
+      context.topic = message.connection->original_topic.empty()
+                          ? message.connection->topic : message.connection->original_topic;
+      context.type = normalize_type(message.connection->type);
+      context.serialization_format = message.connection->serialization_format;
+    }
+    return context;
+  };
+  if (!message.connection || !message.bytes) {
+    DecodeError error("message has no connection/data");
+    error.add_context(message_context());
+    throw error;
+  }
   const auto* support = registry.find(profile, message.connection->type);
   if (!support) {
     const auto text = "unregistered message type: " + message.connection->type + " on " +
                       message.connection->topic;
     if (warning) warning(text);
-    if (policy == UnknownTypePolicy::Error) throw DecodeError(text);
+    if (policy == UnknownTypePolicy::Error) {
+      DecodeError error(text);
+      error.add_context(message_context());
+      throw error;
+    }
     if (policy == UnknownTypePolicy::WarnAndRaw) return DecodedMessage{nullptr, nullptr, &message};
     return std::nullopt;
   }
@@ -330,10 +401,13 @@ std::optional<DecodedMessage> decode(const Message& message, const TypeRegistry&
                                message.connection->serialization_format);
     }
     return DecodedMessage{std::move(object), support, &message};
-  } catch (const RosbagsError&) {
+  } catch (RosbagsError& error) {
+    error.add_context(message_context());
     throw;
   } catch (const std::exception& error) {
-    throw DecodeError(error.what());
+    DecodeError wrapped(error.what());
+    wrapped.add_context(message_context());
+    std::throw_with_nested(wrapped);
   }
 }
 
@@ -369,6 +443,44 @@ std::string normalize_topic(std::string_view topic) {
   }
   while (result.size() > 1 && result.back() == '/') result.pop_back();
   return result;
+}
+
+bool topics_match(std::string_view left, std::string_view right,
+                  TopicMatchPolicy policy, std::string_view topic_namespace) {
+  auto name_space = normalize_topic(topic_namespace);
+  if (policy == TopicMatchPolicy::ResolveNamespace &&
+      (name_space.empty() || name_space.front() != '/'))
+    throw RosbagsError("topic namespace must be absolute");
+  const auto key = [&](std::string_view name) {
+    auto value = normalize_topic(name);
+    if (policy == TopicMatchPolicy::IgnoreLeadingSlash) {
+      if (!value.empty() && value.front() == '/') value.erase(0, 1);
+    } else if (policy == TopicMatchPolicy::ResolveNamespace &&
+               !value.empty() && value.front() != '/') {
+      value = normalize_topic(name_space + "/" + value);
+    }
+    return value;
+  };
+  return key(left) == key(right);
+}
+
+std::uint64_t timestamp_nanoseconds(std::int64_t seconds, std::uint32_t nanoseconds) {
+  constexpr std::uint64_t scale = 1000000000;
+  if (seconds < 0 || nanoseconds >= scale ||
+      static_cast<std::uint64_t>(seconds) >
+          (std::numeric_limits<std::uint64_t>::max() - nanoseconds) / scale)
+    throw RosbagsError("timestamp is outside the unsigned nanosecond range");
+  return static_cast<std::uint64_t>(seconds) * scale + nanoseconds;
+}
+
+std::uint64_t nanoseconds_to_microseconds(std::uint64_t nanoseconds) noexcept {
+  return nanoseconds / 1000;
+}
+
+std::uint64_t microseconds_to_nanoseconds(std::uint64_t microseconds) {
+  if (microseconds > std::numeric_limits<std::uint64_t>::max() / 1000)
+    throw RosbagsError("microsecond timestamp overflows nanoseconds");
+  return microseconds * 1000;
 }
 
 std::string normalize_type(std::string_view type) {

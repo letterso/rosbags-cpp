@@ -257,6 +257,7 @@ class Rosbag1Backend final : public Backend {
         Connection connection;
         connection.id = connection_id;
         connection.topic = normalize_topic(raw_topic);
+        connection.original_topic = raw_topic;
         connection.type = normalize_type(field_string(second.fields, "type"));
         connection.definition = {DefinitionFormat::Msg, field_string(second.fields, "message_definition", false)};
         connection.digest = field_string(second.fields, "md5sum", false);
@@ -426,7 +427,7 @@ class Rosbag1Backend::Cursor final : public BackendCursor {
     if (time != entry.timestamp) throw FormatError(context(owner_.path_, "IDXDATA timestamp mismatch"));
     const auto* connection = owner_.find_connection(field_u32(record.header.fields, "conn"));
     if (!connection) throw FormatError(context(owner_.path_, "MSGDATA references unknown connection"));
-    output = Message{std::make_shared<Bytes>(record.body.data, record.body.data + record.body.size), time, connection};
+    output = Message{std::make_shared<Bytes>(record.body.data, record.body.data + record.body.size), time, connection, owner_.path_};
     const auto next_position = item.position + 1;
     if (next_position < item.entries->size()) {
       const auto& next = (*item.entries)[next_position];

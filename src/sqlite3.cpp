@@ -184,6 +184,7 @@ class SqliteBackend final : public Backend {
       const auto* type = reinterpret_cast<const char*>(sqlite3_column_text(statement, 2));
       const auto* format = reinterpret_cast<const char*>(sqlite3_column_text(statement, 4));
       connection.topic = topic ? normalize_topic(topic) : "";
+      connection.original_topic = topic ? topic : "";
       connection.type = type ? normalize_type(type) : "";
       connection.message_count = static_cast<std::uint64_t>(sqlite3_column_int64(statement, 3));
       connection.serialization_format = format ? format : "";
@@ -289,7 +290,7 @@ class SqliteBackend::Cursor final : public BackendCursor {
     if (size < 0 || (size != 0 && !data)) throw FormatError("invalid SQLite message blob");
     auto bytes = std::make_shared<Bytes>();
     if (size) bytes->assign(data, data + size);
-    output = Message{std::move(bytes), static_cast<std::uint64_t>(timestamp), connection};
+    output = Message{std::move(bytes), static_cast<std::uint64_t>(timestamp), connection, owner_.path_};
     return true;
   }
 
@@ -339,7 +340,8 @@ class DirectoryBackend final : public Backend {
           const auto topic = item["topic_metadata"];
           Connection connection;
           connection.id = id++;
-          connection.topic = normalize_topic(node_string(topic, "name"));
+          connection.original_topic = node_string(topic, "name");
+          connection.topic = normalize_topic(connection.original_topic);
           connection.type = normalize_type(node_string(topic, "type"));
           connection.serialization_format = node_string(topic, "serialization_format");
           connection.message_count = node_uint64(item, "message_count");
@@ -384,11 +386,25 @@ class DirectoryBackend final : public Backend {
           throw FormatError("rosbag2 relative_file_paths contains an invalid path");
         // Match rosbag2's storage convention: metadata paths are basenames.
         const auto input = std::filesystem::path(path_) / relative.filename();
-        if (!std::filesystem::exists(input)) throw FormatError(context(input.string(), "storage file is missing"));
+        if (!std::filesystem::exists(input)) {
+          FormatError error("storage file is missing");
+          ErrorContext details;
+          details.source_path = input.string();
+          error.add_context(details);
+          throw error;
+        }
         std::string actual = input.string();
-        if (compression_mode_ == "file") actual = decompress_file(input);
-        auto backend = storage == "sqlite3" ? make_sqlite_backend(actual) : make_mcap_backend(actual);
-        backend->open();
+        std::unique_ptr<Backend> backend;
+        try {
+          if (compression_mode_ == "file") actual = decompress_file(input);
+          backend = storage == "sqlite3" ? make_sqlite_backend(actual) : make_mcap_backend(actual);
+          backend->open();
+        } catch (RosbagsError& error) {
+          ErrorContext context;
+          context.source_path = input.string();
+          error.add_context(context);
+          throw;
+        }
         backends_.push_back(std::move(backend));
         metadata_.files.push_back(actual);
       }
@@ -539,12 +555,19 @@ class DirectoryBackend::Cursor final : public BackendCursor {
   void pull(std::size_t source_index) {
     auto& source = sources_[source_index];
     Message message;
-    while (source.cursor->next(message)) {
-      const auto* connection = map_connection(message.connection);
-      if (!connection || !has_topic(*connection, filter_) || !in_time(message.timestamp, filter_)) continue;
-      source.head = std::move(message);
-      heap_.push({source.head->timestamp, source_index});
-      return;
+    try {
+      while (source.cursor->next(message)) {
+        const auto* connection = map_connection(message.connection);
+        if (!connection || !has_topic(*connection, filter_) || !in_time(message.timestamp, filter_)) continue;
+        source.head = std::move(message);
+        heap_.push({source.head->timestamp, source_index});
+        return;
+      }
+    } catch (RosbagsError& error) {
+      ErrorContext context;
+      context.source_path = owner_.metadata_.files.at(source_index);
+      error.add_context(context);
+      throw;
     }
   }
 

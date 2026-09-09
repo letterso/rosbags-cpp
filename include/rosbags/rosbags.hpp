@@ -28,6 +28,7 @@ struct ByteView {
 
 enum class StorageKind { Rosbag1, Sqlite3, Mcap };
 enum class DefinitionFormat { None, Msg, Idl };
+enum class TopicMatchPolicy { Strict, IgnoreLeadingSlash, ResolveNamespace };
 enum class UnknownTypePolicy { WarnAndSkip, WarnAndRaw, Error };
 
 struct MessageDefinition {
@@ -50,6 +51,8 @@ struct Connection {
   std::vector<QosProfile> qos_profiles;
   std::optional<std::string> callerid;
   std::optional<int> latching;
+  // Original storage spelling for diagnostics; topic retains normalized spelling.
+  std::string original_topic = {};
 };
 
 struct ReaderMetadata {
@@ -67,6 +70,7 @@ struct Message {
   std::shared_ptr<const Bytes> bytes;
   std::uint64_t timestamp = 0;
   const Connection* connection = nullptr;
+  std::string source_path = {};
 };
 
 struct ReadFilter {
@@ -74,11 +78,32 @@ struct ReadFilter {
   std::vector<std::uint32_t> connection_ids;
   std::optional<std::uint64_t> start;
   std::optional<std::uint64_t> stop;
+  TopicMatchPolicy topic_match = TopicMatchPolicy::Strict;
+  std::string topic_namespace;
+};
+
+struct ErrorContext {
+  std::optional<std::string> source_path;
+  std::optional<std::uint32_t> connection_id;
+  std::optional<std::string> topic;
+  std::optional<std::string> type;
+  std::optional<std::string> serialization_format;
+  std::optional<std::uint64_t> timestamp;
+  std::optional<std::size_t> byte_offset;
 };
 
 class RosbagsError : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
+  const ErrorContext& context() const noexcept { return context_; }
+  // Fill missing context without replacing more precise information or slicing
+  // derived exceptions. The original reason remains available via reason().
+  void add_context(const ErrorContext& context);
+  const char* reason() const noexcept { return std::runtime_error::what(); }
+  const char* what() const noexcept override;
+ private:
+  ErrorContext context_;
+  std::string diagnostic_;
 };
 class FormatError : public RosbagsError { using RosbagsError::RosbagsError; };
 class UnsupportedFeature : public RosbagsError { using RosbagsError::RosbagsError; };
@@ -251,7 +276,16 @@ std::optional<DecodedMessage> decode(const Message& message, const TypeRegistry&
 
 std::string storage_kind_name(StorageKind kind);
 std::string definition_format_name(DefinitionFormat format);
+// Normalization preserves relative versus absolute names; it does not resolve names.
 std::string normalize_topic(std::string_view topic);
+bool topics_match(std::string_view left, std::string_view right,
+                  TopicMatchPolicy policy = TopicMatchPolicy::Strict,
+                  std::string_view topic_namespace = {});
+// Bag timestamps are unsigned integer nanoseconds. Negative seconds, invalid
+// subsecond values and overflow are rejected; conversion to microseconds floors.
+std::uint64_t timestamp_nanoseconds(std::int64_t seconds, std::uint32_t nanoseconds);
+std::uint64_t nanoseconds_to_microseconds(std::uint64_t nanoseconds) noexcept;
+std::uint64_t microseconds_to_nanoseconds(std::uint64_t microseconds);
 std::string normalize_type(std::string_view type);
 
 }  // namespace rosbags

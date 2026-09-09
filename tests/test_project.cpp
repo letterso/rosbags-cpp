@@ -8,11 +8,15 @@
 #include <sqlite3.h>
 #include <lz4frame.h>
 #include <zstd.h>
+#if ROSBAGS_HAS_MCAP
+#include <mcap/writer.hpp>
+#endif
 
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -184,6 +188,16 @@ TEST_CASE("reads SQLite bags in timestamp order" * doctest::test_suite("project"
   std::vector<std::uint64_t> timestamps;
   reader.read_raw({}, [&](const rosbags::Message& message) { timestamps.push_back(message.timestamp); });
   CHECK((timestamps == std::vector<std::uint64_t>{10, 20}));
+  rosbags::ReadFilter filter;
+  filter.topics = {"numbers"};
+  rosbags::Message filtered;
+  CHECK_FALSE(reader.messages(filter).next(filtered));
+  filter.topic_match = rosbags::TopicMatchPolicy::IgnoreLeadingSlash;
+  CHECK(reader.messages(filter).next(filtered));
+  CHECK(filtered.source_path == path.string());
+  filter.topic_match = rosbags::TopicMatchPolicy::ResolveNamespace;
+  filter.topic_namespace = "/";
+  CHECK(reader.messages(filter).next(filtered));
   {
     auto cursor = reader.messages();
     rosbags::Reader replacement(path.string());
@@ -258,6 +272,7 @@ TEST_CASE("reads ROS2 directory metadata and decoded messages" * doctest::test_s
     REQUIRE(message.connection != nullptr);
     CHECK(message.connection->topic == "/text");
     CHECK(message.timestamp == 42);
+    CHECK(message.source_path == path.string());
     ++count;
   });
   CHECK(count == 1);
@@ -272,7 +287,23 @@ TEST_CASE("reads ROS2 directory metadata and decoded messages" * doctest::test_s
                      },
                      rosbags::UnknownTypePolicy::Error);
   CHECK(decoded_count == 1);
+  rosbags::TypeRegistry empty_registry;
+  try {
+    reader.read_decoded({}, empty_registry, "ros2_humble",
+                        [](const auto&, const auto&) {}, rosbags::UnknownTypePolicy::Error);
+    FAIL("expected unknown type in a shard");
+  } catch (const rosbags::DecodeError& error) {
+    CHECK(error.context().source_path == path.string());
+    CHECK(error.context().timestamp == 42);
+  }
   reader.close();
+  std::filesystem::remove(path);
+  try {
+    reader.open();
+    FAIL("expected missing shard");
+  } catch (const rosbags::FormatError& error) {
+    CHECK(error.context().source_path == path.string());
+  }
   std::filesystem::remove_all(directory);
 }
 
@@ -700,3 +731,116 @@ TEST_CASE("generates C++ types and registry from message definitions" * doctest:
 }
 
 }  // namespace
+
+TEST_CASE("topic matching is explicit and namespace aware" * doctest::test_suite("project")) {
+  using rosbags::TopicMatchPolicy;
+  CHECK(rosbags::normalize_topic("imu//data/") == "imu/data");
+  CHECK(rosbags::topics_match("/imu//data/", "/imu/data"));
+  CHECK_FALSE(rosbags::topics_match("imu", "/imu"));
+  CHECK(rosbags::topics_match("imu", "///imu/", TopicMatchPolicy::IgnoreLeadingSlash));
+  CHECK(rosbags::topics_match("imu", "/robot/imu", TopicMatchPolicy::ResolveNamespace, "/robot//"));
+  CHECK_FALSE(rosbags::topics_match("/imu", "/robot/imu", TopicMatchPolicy::ResolveNamespace, "/robot"));
+  CHECK_THROWS_AS(rosbags::topics_match("imu", "imu", TopicMatchPolicy::ResolveNamespace, "robot"), rosbags::RosbagsError);
+}
+
+TEST_CASE("integer timestamp conversions check ranges" * doctest::test_suite("project")) {
+  const auto maximum = std::numeric_limits<std::uint64_t>::max();
+  CHECK(rosbags::timestamp_nanoseconds(0, 1) == 1);
+  CHECK(rosbags::timestamp_nanoseconds(1, 999999999) == 1999999999);
+  CHECK(rosbags::timestamp_nanoseconds(maximum / 1000000000, maximum % 1000000000) == maximum);
+  CHECK_THROWS_AS(rosbags::timestamp_nanoseconds(-1, 0), rosbags::RosbagsError);
+  CHECK_THROWS_AS(rosbags::timestamp_nanoseconds(0, 1000000000), rosbags::RosbagsError);
+  CHECK_THROWS_AS(rosbags::timestamp_nanoseconds(maximum / 1000000000, maximum % 1000000000 + 1), rosbags::RosbagsError);
+  CHECK(rosbags::nanoseconds_to_microseconds(1999) == 1);
+  CHECK(rosbags::microseconds_to_nanoseconds(maximum / 1000) == maximum - maximum % 1000);
+  CHECK_THROWS_AS(rosbags::microseconds_to_nanoseconds(maximum / 1000 + 1), rosbags::RosbagsError);
+}
+
+TEST_CASE("decode errors retain category reason and structured context" * doctest::test_suite("project")) {
+  rosbags::TypeRegistry registry;
+  rosbags::profiles::register_builtin_types(registry, "ros2_humble");
+  rosbags::Connection connection;
+  connection.id = 7;
+  connection.topic = "/imu";
+  connection.type = "sensor_msgs/Imu";
+  connection.serialization_format = "cdr";
+  rosbags::Message message{std::make_shared<Bytes>(Bytes{0, 1, 0, 0}), 123, &connection, "part_2.db3"};
+  try {
+    rosbags::decode(message, registry, "ros2_humble", rosbags::UnknownTypePolicy::Error);
+    FAIL("expected truncated IMU");
+  } catch (const rosbags::DecodeError& error) {
+    CHECK(error.context().source_path == message.source_path);
+    CHECK(error.context().connection_id == 7);
+    CHECK(error.context().topic == "/imu");
+    CHECK(error.context().type == "sensor_msgs/msg/Imu");
+    CHECK(error.context().serialization_format == "cdr");
+    CHECK(error.context().timestamp == 123);
+    CHECK(error.context().byte_offset == 4);
+    CHECK(std::string(error.reason()) == "serialized message is truncated");
+    CHECK(std::string(error.what()).find("part_2.db3") != std::string::npos);
+  }
+  connection.serialization_format = "other";
+  try {
+    rosbags::decode(message, registry, "ros2_humble", rosbags::UnknownTypePolicy::Error);
+    FAIL("expected unsupported format");
+  } catch (const rosbags::UnsupportedFeature& error) {
+    CHECK(error.context().serialization_format == "other");
+    CHECK(error.context().timestamp == 123);
+  }
+  connection.type = "custom/Unknown";
+  try {
+    rosbags::decode(message, registry, "ros2_humble", rosbags::UnknownTypePolicy::Error);
+    FAIL("expected unregistered type");
+  } catch (const rosbags::DecodeError& error) {
+    CHECK(error.context().type == "custom/msg/Unknown");
+    CHECK_FALSE(error.context().byte_offset);
+  }
+}
+
+#if ROSBAGS_HAS_MCAP
+TEST_CASE("MCAP filtering preserves name policy and source context" * doctest::test_suite("project")) {
+  const auto path = temp_path(".mcap");
+  mcap::McapWriter writer;
+  mcap::McapWriterOptions options("ros2");
+  options.forceCompression = true;
+  REQUIRE(writer.open(path.string(), options).ok());
+  mcap::Schema schema("std_msgs/msg/String", "ros2msg", "string data");
+  writer.addSchema(schema);
+  mcap::Channel channel("/robot//text/", "cdr", schema.id);
+  writer.addChannel(channel);
+  const Bytes payload{0, 1, 0, 0, 3, 0, 0, 0, 'h', 'i', 0};
+  mcap::Message record{};
+  record.channelId = channel.id;
+  record.data = reinterpret_cast<const std::byte*>(payload.data());
+  record.dataSize = payload.size();
+  for (const auto time : {20, 10}) {
+    record.logTime = record.publishTime = time;
+    REQUIRE(writer.write(record).ok());
+  }
+  writer.close();
+  rosbags::Reader reader(path.string());
+  reader.open();
+  rosbags::ReadFilter filter;
+  filter.topics = {"robot/text"};
+  rosbags::Message message;
+  CHECK_FALSE(reader.messages(filter).next(message));
+  filter.topic_match = rosbags::TopicMatchPolicy::IgnoreLeadingSlash;
+  CHECK(reader.messages(filter).next(message));
+  filter.topics = {"text"};
+  filter.topic_match = rosbags::TopicMatchPolicy::ResolveNamespace;
+  filter.topic_namespace = "/robot";
+  auto cursor = reader.messages(filter);
+  rosbags::TypeRegistry registry;
+  rosbags::profiles::register_builtin_types(registry, "ros2_humble");
+  for (const auto time : {10, 20}) {
+    REQUIRE(cursor.next(message));
+    CHECK(message.timestamp == time);
+    CHECK(message.connection->original_topic == "/robot//text/");
+    CHECK(message.source_path == path.string());
+    auto decoded = rosbags::decode(message, registry, "ros2_humble", rosbags::UnknownTypePolicy::Error);
+    REQUIRE(decoded);
+    CHECK(decoded->as<rosbags::profiles::String>().data == "hi");
+  }
+  CHECK_FALSE(cursor.next(message));
+}
+#endif
