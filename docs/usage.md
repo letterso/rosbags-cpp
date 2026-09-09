@@ -9,13 +9,15 @@
 必须依赖：
 
 - C++17 编译器；
-- CMake 3.16 或更高版本；
+- 关闭 MCAP 时为 CMake 3.16 或更高版本；启用 MCAP 时为 CMake 3.22.1 或更高版本；
 - SQLite3、yaml-cpp、liblz4、libzstd 和 pkg-config 开发文件。
 
 可选依赖：
 
 - BZip2：启用 ROS1 BZip2 chunk 解压；
-- MCAP：`ROSBAGS_ENABLE_MCAP=ON` 时默认启用。自动 FetchContent 路径要求 CMake 3.22.1 或更高版本，并需要 Git/网络访问，或预先准备可用的 FetchContent 缓存。
+- MCAP：`ROSBAGS_ENABLE_MCAP` 默认开启。构建会依次尝试
+  `ROSBAGS_MCAP_ROOT`、可发现的 `mcap` CMake 包和 FetchContent。FetchContent 路径
+  需要 Git/网络访问，或预先准备可用的 FetchContent 缓存。
 
 ### 1.2 常用构建
 
@@ -28,6 +30,18 @@ cmake -S . -B build \
 cmake --build build -j2
 ctest --test-dir build --output-on-failure
 ```
+
+未设置 `BUILD_SHARED_LIBS` 时生成静态库。需要动态库时，显式指定：
+
+```bash
+cmake -S . -B build-shared \
+  -DBUILD_SHARED_LIBS=ON \
+  -DROSBAGS_BUILD_TESTS=ON \
+  -DROSBAGS_BUILD_TOOLS=ON
+```
+
+在 macOS 和 Linux 上，安装后的动态库和三个 CLI 都带有相对运行时搜索路径；可将
+完整安装前缀迁移到另一位置后使用。仍应在目标系统中提供未随包安装的系统依赖。
 
 没有网络或不需要 MCAP 时：
 
@@ -45,11 +59,21 @@ cmake --build build-no-mcap -j2
 build-no-mcap/rosbags_cpp_tests
 ```
 
-使用已有 MCAP SDK 时，前缀需要包含 `include/mcap_vendor/mcap/reader.hpp` 和 `lib/libmcap.so`：
+使用已有 MCAP SDK 时，设置 `ROSBAGS_MCAP_ROOT`。当前构建会在
+`<prefix>/include/mcap_vendor` 或 `<prefix>/include` 查找 `mcap/reader.hpp`，并在
+`<prefix>/lib` 查找名为 `mcap` 的静态库或动态库：
 
 ```bash
 cmake -S . -B build-mcap \
   -DROSBAGS_MCAP_ROOT=/path/to/mcap-prefix
+```
+
+若 SDK 已提供 CMake 包，也可将其前缀加入 `CMAKE_PREFIX_PATH`，无需设置
+`ROSBAGS_MCAP_ROOT`：
+
+```bash
+cmake -S . -B build-mcap \
+  -DCMAKE_PREFIX_PATH=/path/to/mcap-prefix
 ```
 
 自动下载的仓库和版本可覆盖：
@@ -68,9 +92,9 @@ cmake -S . -B build-mcap \
 
 ### 1.3 Cppcheck 静态检测
 
-> 建议https://github.com/cppcheck-opensource/cppcheck安装新的release版本，避免针对现代C++标准进行检查时出现问题
+> 建议到 https://github.com/cppcheck-opensource/cppcheck 安装新的release版本，避免针对现代C++标准进行检查时出现问题
 
-本工程静态检测不使用系统默认的`/usr/bin/cppcheck`（版本较低，出现误检或者漏检），固定使用 `/usr/local/bin/cppcheck`，不会回退到系统默认的`/usr/bin/cppcheck` 或 `PATH` 中的其他版本。启用前确认该文件存在且可执行：
+本工程静态检测不使用系统默认的`/usr/bin/cppcheck`（版本较低，出现误检或者漏检），固定使用 `/usr/local/bin/cppcheck`，不会回退到系统默认的`/usr/bin/cppcheck` 或 `PATH` 中的其他版本，默认关闭，启用前确认该文件存在且可执行：
 
 ```bash
 test -x /usr/local/bin/cppcheck
@@ -105,7 +129,10 @@ add_executable(example main.cpp)
 target_link_libraries(example PRIVATE rosbags_cpp::rosbags_cpp)
 ```
 
-MCAP 由本项目自动构建并安装时，安装包同时导出 `mcap` 依赖；下游不需要再初始化 ROS。
+MCAP 由本项目自动构建并安装时，安装包同时导出 `mcap` 依赖；下游不需要初始化
+ROS。若构建时使用 `ROSBAGS_MCAP_ROOT`，下游配置也必须提供同一 SDK 前缀；若构建时
+通过 `CMAKE_PREFIX_PATH` 找到 `mcap` 包，下游也应使该包可被发现。SDK 路径会在下游
+机器重新解析，不会固化在导出的配置中。
 
 ## 2. 输入路径和格式判断
 
@@ -260,9 +287,37 @@ int main() {
 }
 ```
 
-过滤规则为：topic 规范化后匹配，`start` 包含，`stop` 不包含。`connection_ids` 也可以直接指定连接 ID；通常优先使用 topic 过滤。
+过滤时先按所选策略比较 topic，`start` 包含，`stop` 不包含。`connection_ids` 也可以
+直接指定连接 ID；通常优先使用 topic 过滤。
 
-### 4.3 增量游标和 ROS1 内存上限
+### 4.3 Topic 匹配与时间戳单位
+
+`normalize_topic()` 会合并重复斜杠并删除末尾斜杠，但保留相对名称和绝对名称的
+区别。`ReadFilter::topic_match` 默认使用 `TopicMatchPolicy::Strict`，因此 `imu` 和
+`/imu` 不匹配。可按需选择其他策略：
+
+```cpp
+rosbags::ReadFilter filter;
+filter.topics = {"imu"};
+filter.topic_match = rosbags::TopicMatchPolicy::ResolveNamespace;
+filter.topic_namespace = "/robot";  // 匹配 /robot/imu，不匹配 /imu
+```
+
+`TopicMatchPolicy::IgnoreLeadingSlash` 将 `imu` 和 `/imu` 视为等价。
+`TopicMatchPolicy::ResolveNamespace` 要求提供绝对命名空间；它会解析两侧的相对名称，
+并保持绝对名称不变。这些是比较策略，并非完整的 ROS 名称解析：不会解释私有名称
+或重映射规则。`topics_match()` 为应用代码提供相同的比较方式。过滤器不会改写连接
+中存储的名称；`Connection::topic` 保存规范化后的拼写，`original_topic` 为诊断保留
+存储中的原始拼写。
+
+消息记录时间戳和过滤边界均使用无符号整数纳秒；`start` 为包含边界，`stop` 为
+排除边界。消息头中的时间戳描述采样时间，绝不会替代记录时间戳。
+`timestamp_nanoseconds(seconds, nanoseconds)` 会拒绝负秒数、达到或超过十亿的亚秒
+分量，以及溢出情况，并抛出 `RosbagsError`。`microseconds_to_nanoseconds()` 同样会
+检查溢出。`nanoseconds_to_microseconds()` 会向下取整，因而有意丢弃不足一微秒的
+余数；需要精确比较时应保留整数纳秒。
+
+### 4.4 增量游标和 ROS1 内存上限
 
 `messages()` 返回只能移动的 `MessageCursor`，适合需要暂停、限速或自行管理读取节奏的应用；`read_raw()` 仍是等价的回调封装。
 
@@ -281,7 +336,7 @@ while (cursor.next(message)) {
 
 ROS1 默认上限为 256 MiB，限制的是单个 chunk 的解压后大小；超过限制会抛出 `ResourceLimitError`，而不是尝试分配无界内存。`Reader` 和 `AnyReader` 的 cursor 都会共享持有内部状态，因此移动或销毁 reader 外壳不会使 cursor 失效；两类 cursor 都必须在显式 `close()` 前销毁。ROS1 为精确时间排序仍保存消息索引，因此极大消息数的索引内存不受这个选项限制。
 
-### 4.4 内置类型解码
+### 4.5 内置类型解码
 
 ```cpp
 #include <rosbags/profiles.hpp>
@@ -307,7 +362,7 @@ int main() {
 
 ROS1 输入使用 `ros1_noetic`，ROS2 CDR 输入使用对应的 `ros2_*` profile。profile 参与 registry key；类型已注册但 profile 不匹配时仍会被视为未知类型。
 
-### 4.5 未知类型策略
+### 4.6 未知类型策略
 
 ```cpp
 const auto decoded = rosbags::decode(
@@ -328,7 +383,7 @@ if (decoded && decoded->raw_only()) {
 | `WarnAndRaw` | warning 后返回 `raw_only()`，可以继续使用 `source->bytes`。 |
 | `Error` | 立即抛出 `DecodeError`。 |
 
-### 4.6 多文件读取：`AnyReader`
+### 4.7 多文件读取：`AnyReader`
 
 ```cpp
 rosbags::AnyReader reader({
@@ -389,7 +444,7 @@ struct Status {
 
 ```bash
 build/rosbags-gen \
-  --profile ros2_humble \
+  --profile application \
   --input definitions/demo_msgs \
   --output build/generated/demo_msgs
 ```
@@ -411,21 +466,21 @@ target_link_libraries(my_reader PRIVATE rosbags_cpp::rosbags_cpp)
 C++ 注册并读取：
 
 ```cpp
-#include "ros2_humble_registry.hpp"
+#include "application_registry.hpp"
 #include <rosbags/rosbags.hpp>
 
 int main() {
   rosbags::TypeRegistry registry;
-  rosbags::generated::ros2_humble::register_types(registry);
+  rosbags::generated::application::register_types(registry);
 
   rosbags::Reader reader("/data/run_01");
   reader.open();
   rosbags::ReadFilter filter;
   filter.topics = {"/telemetry"};
   reader.read_decoded(
-      filter, registry, "ros2_humble",
+      filter, registry, "application",
       [](const rosbags::Message&, const rosbags::DecodedMessage& decoded) {
-        using Telemetry = rosbags::generated::ros2_humble::demo_msgs::msg::Telemetry;
+        using Telemetry = rosbags::generated::application::demo_msgs::msg::Telemetry;
         const auto& value = decoded.as<Telemetry>();
         (void)value.sequence;
       },
@@ -433,13 +488,55 @@ int main() {
 }
 ```
 
-生成器会同时生成 ROS1 和 CDR 读取函数；因此同一组定义可以分别用于 `ros1_noetic` 或 `ros2_*` profile，但定义字段必须与录包时的 wire layout 一致。
+生成器会为每个类型同时生成 ROS1 和 CDR 读取函数。自定义定义相同时，应用可将
+它们注册到一个 profile，并用同一个 C++ 类型读取两种序列化格式；定义字段必须与
+录包时的二进制布局一致。这不会自动建立不同自定义定义之间的兼容性，也不会
+自动重命名包。
 
-### 5.5 自定义消息的两条路径
+### 5.5 已安装 CMake 集成
+
+使用 `ROSBAGS_BUILD_TOOLS=ON` 构建并安装后，会导出
+`rosbags_cpp::rosbags-gen`。下游项目将安装前缀加入 `CMAKE_PREFIX_PATH`，即可使用
+`rosbags_generate_messages()`：
+
+```cmake
+find_package(rosbags_cpp CONFIG REQUIRED)
+rosbags_generate_messages(my_messages
+  PROFILE application
+  INPUTS "${CMAKE_CURRENT_SOURCE_DIR}/definitions")
+add_executable(example main.cpp)
+target_link_libraries(example PRIVATE my_messages)
+```
+
+对于 `definitions/example/msg/Envelope.msg`，包含
+`application_registry.hpp` 并调用
+`rosbags::generated::application::register_types(registry)`。类型位于
+`rosbags::generated::application::example::msg` 命名空间中。生成目标会传递核心库、
+C++17 要求、包含目录及代码生成依赖；输出位于
+`<当前二进制目录>/my_messages_generated`。该接口目标仅供当前构建使用，不应用于
+重新导出为已安装的消息包。
+
+`INPUTS` 可接受多个文件或目录，且必须提供所有自定义嵌套定义。目录会被递归跟踪，
+包括 `.msg` 和 `.idl` 文件的新增、删除和修改；标准依赖使用内置类型。`PROFILE`
+必须是合法的非关键字 C++ 标识符。
+
+交叉编译时，必须明确指定宿主机生成器：
+
+```cmake
+rosbags_generate_messages(my_messages
+  PROFILE application
+  INPUTS "${CMAKE_CURRENT_SOURCE_DIR}/definitions"
+  GENERATOR /absolute/path/to/host/rosbags-gen)
+```
+
+宿主机工具必须由兼容版本的库构建。即使原生构建时未安装工具，也可用该参数指定
+现有生成器；交叉编译时若省略该参数，配置会在尝试执行目标架构程序之前失败。
+
+### 5.6 自定义消息的两条路径
 
 | 路径 | 适用类型 | 注册方式 | 取舍 |
 | --- | --- | --- | --- |
-| 生成器路径 | 不属于 ROS 标准发行版的消息，以及项目或设备自定义消息 | 用 `rosbags-gen` 生成 `<profile>_messages.hpp` 和 `<profile>_registry.hpp`，调用生成的 `register_types()` | 不修改库内置 profile；定义和 wire layout 随应用版本管理，可同时生成 ROS1/CDR decoder |
+| 生成器路径 | 不属于 ROS 标准发行版的消息，以及项目或设备自定义消息 | 用 `rosbags-gen` 生成 `<profile>_messages.hpp` 和 `<profile>_registry.hpp`，调用生成的 `register_types()` | 不修改库内置 profile；定义和二进制布局随应用版本管理，可同时生成 ROS1/CDR decoder |
 | 内置 profile 路径 | 需要长期作为库公共 API 的稳定 ROS 标准消息；把自定义消息手写进库也属于此路径 | 在 `profiles.hpp/.cpp` 增加结构体、ROS1/CDR decoder 和 `register_builtin_types()` 注册 | 使用方便，但会扩大库的固定 API 和维护面，不能覆盖任意包名或设备私有定义 |
 
 建议：凡是非 ROS 标准消息类型，统一走生成器路径。只有在消息属于稳定的
@@ -458,6 +555,26 @@ ROS 标准接口、且希望作为所有应用的通用依赖时，才考虑扩�
 | `unsupported ... compression` | 当前构建是否带 BZip2，ROS2 压缩模式是否为支持的 zstd file/message。 |
 
 异常类型可按以下方式区分：`FormatError` 表示文件格式或结构损坏，`UnsupportedFeature` 表示当前构建/后端没有该能力，`DecodeError` 表示类型或序列化 payload 无法解码，`RosbagsError` 表示通用状态或 I/O 错误。
+
+### 6.1 结构化诊断信息
+
+仍可按原方式捕获 `DecodeError`、`FormatError`、`UnsupportedFeature` 或其他
+`RosbagsError` 子类。解码失败时，`error.context()` 会按已知信息提供可选的
+`source_path`、`connection_id`、原始 `topic`、规范化 `type`、
+`serialization_format`、`timestamp`（纳秒）和 `byte_offset` 字段。
+`error.reason()` 保留原始原因；`what()` 会加入易读的上下文。正常解码不会构造
+异常上下文。
+
+payload 截断和尾随数据检查会报告相对序列化 payload 起点的偏移，其中包含 CDR
+封装头；其他错误未必能确定字节偏移。读取器产生的消息带有 `source_path`，其中包括
+目录分片实际使用的后端文件。文件压缩输入可能指向解压后的临时后端文件；独立调用方
+可设置 `Message::source_path`。打开或读取失败会附加已知的最具体文件；在尚未得到
+消息前发生的失败不会凭空构造 connection 或时间戳。当前不跟踪字段路径。不属于
+`RosbagsError` 层级的自定义解码器异常会被嵌套在 `DecodeError` 中。
+
+这些新增内容改变了公共结构体和异常的内存布局；升级库时需要重新编译下游二进制
+程序。缓冲区和 connection 的所有权规则不变：复制的 `Message` 拥有其字节，而其
+connection 指针仍要求相应的 reader/cursor 状态保持有效。
 
 ## 7. 验证建议
 
