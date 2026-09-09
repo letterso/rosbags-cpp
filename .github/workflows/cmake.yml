@@ -1,0 +1,16 @@
+name: C++ build and installed consumer
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        mcap: ['ON', 'OFF']
+        shared: ['ON', 'OFF']
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libyaml-cpp-dev liblz4-dev libzstd-dev libbz2-dev pkg-config
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DROSBAGS_BUILD_TESTS=ON -DROSBAGS_BUILD_TOOLS=ON -DROSBAGS_ENABLE_MCAP=${{ matrix.mcap }} -DBUILD_SHARED_LIBS=${{ matrix.shared }}
+      - run: cmake --build build -j2
+      - run: ctest --test-dir build --output-on-failure
