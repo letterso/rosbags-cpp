@@ -2,10 +2,11 @@ name: C++ build and installed consumer
 on: [push, pull_request]
 jobs:
   test:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
         mcap: ['ON', 'OFF']
         shared: ['ON', 'OFF']
     steps:
