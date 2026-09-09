@@ -2,6 +2,30 @@
 
 本文件记录 `rosbags-cpp` 的版本更新。
 
+## [0.1.4] - 2026-09-09
+
+### 新增
+
+- 增加结构化错误上下文 `ErrorContext`，支持通过 `RosbagsError::context()` 获取源文件、连接、topic、类型、序列化格式、时间戳和字节偏移；`reason()` 保留原始原因，`what()` 提供包含上下文的可读诊断信息。
+- 为 `Message` 增加来源文件信息，为 `Connection` 保留存储中的原始 topic 拼写，并为解码和读取错误提供跨 ROS1、ROS2 SQLite、ROS2 目录及 MCAP 后端的来源定位。
+- 增加 `TopicMatchPolicy` 和 `topics_match()`，支持严格匹配、忽略首个斜杠以及基于绝对命名空间解析相对 topic；增加时间戳纳秒/微秒转换函数及范围校验。
+- 导出可安装的 CMake package、`rosbags-info`、`rosbags-read` 和 `rosbags-gen`，并增加 `rosbags_generate_messages()`，支持 `.msg`/`.idl` 定义、嵌套依赖、配置变更追踪和交叉编译时指定宿主机生成器。
+
+### 改进
+
+- 完善解码异常处理：保留 `RosbagsError` 派生类型，为截断、尾随数据和自定义解码器异常附加消息上下文及字节偏移，并继续保留原始错误原因。
+- 改进已安装包对 SQLite、yaml-cpp、LZ4、zstd、BZip2 和外部 MCAP SDK 的依赖导出、动态库运行时路径及可重定位安装目录的支持。
+
+### 测试与工程维护
+
+- 增加已安装 CMake package 的端到端下游测试，覆盖重定位安装、重复 `find_package()`、已有压缩依赖 target、消息定义新增/修改/删除后的重新生成、ROS1/CDR 解码、交叉编译约束和非法 profile 校验。
+- 增加 GitHub Actions CMake 矩阵，覆盖 Ubuntu 22.04/24.04、MCAP 开关和静态/动态库构建；补充构建变体忽略规则。
+
+### 文档
+
+- 更新使用文档，补充 topic 匹配策略、时间戳边界、结构化诊断信息、公共 API 兼容性和已安装 CMake 消息生成集成说明。
+- 扩充 C++ 测试说明，记录 CTest 测试目标、安装验收、问题定位方式以及 CI 配置覆盖范围。
+
 ## [0.1.3] - 2026-09-07
 
 ### 新增
