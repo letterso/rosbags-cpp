@@ -178,6 +178,18 @@ endif()
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Cppcheck.cmake")
 
 if(ROSBAGS_BUILD_TESTS)
+  add_test(NAME rosbags_cpp_install_test
+    COMMAND ${CMAKE_COMMAND}
+      -DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}
+      -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+      -DCONFIG=$<CONFIG>
+      -DWITH_GENERATOR=${ROSBAGS_BUILD_TOOLS}
+      "-DBIN_DIR=${CMAKE_INSTALL_BINDIR}"
+      "-DEXE_SUFFIX=${CMAKE_EXECUTABLE_SUFFIX}"
+      "-DSDK_PREFIX=${ROSBAGS_MCAP_ROOT}"
+      "-DSDK_CONFIG_DIR=${mcap_DIR}"
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/install_test.cmake)
+  set_tests_properties(rosbags_cpp_install_test PROPERTIES TIMEOUT 120)
   # doctest v2.5.3 is vendored as its official single header.  No doctest
   # library is linked; test_main.cpp provides the header-only implementation.
   set(ROSBAGS_DOCTEST_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tests/third_party")
