@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(rosbags_cpp VERSION 0.1.0 LANGUAGES CXX)
+project(rosbags_cpp VERSION 0.1.5 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CTest)
