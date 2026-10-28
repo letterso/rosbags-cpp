@@ -67,6 +67,7 @@ MCAP 时，其余库测试仍会执行。
 | `test_codegen_compile.cpp` | 构建期生成的嵌套消息头的编译与注册测试。 |
 | `install_test.cmake`、`install/` | 已安装 CMake package 的独立消费者验收。 |
 | `data/` | 代码生成和 CLI 测试使用的小型确定性消息定义。 |
+| `data/review/` | 有界字段、byte/time/duration、空元素与递归序列的生成、编译及真实 payload 回归。 |
 | `support/temp_directory.hpp` | 随机独占、析构自动清理的临时目录。 |
 | `support/process.hpp` | 通过 POSIX `posix_spawn` 直接传递 argv，并分别捕获 stdout/stderr 的进程启动器。 |
 | `third_party/doctest/` | 随仓库引入的 doctest v2.5.3。 |
@@ -104,3 +105,18 @@ GitHub Actions 在 Ubuntu 24.04 上组合验证
 `FETCHCONTENT_SOURCE_DIR_MCAP_BUILDER` 和 `FETCHCONTENT_SOURCE_DIR_MCAP` 指向已存在的
 上游源码。外部 MCAP SDK 另行通过 `-DROSBAGS_MCAP_ROOT=/path/to/sdk` 或其 CMake 包的
 `CMAKE_PREFIX_PATH` 进行验证。
+
+新增回归覆盖无 topic 的 SQL 时间绑定、uint64 边界、ROS1 错误连接索引与分配前长度检查、目录编码冲突、独立解码预算，以及 zstd 拼接帧、截断和临时文件清理。MCAP 开启时覆盖 default/noMessageIndex/noChunking/noStatistics/noSummary/noRepeatedChannels/noRepeatedSchemas、空文件、乱序写入、时间相同的稳定顺序和 `AnyReader` 合并。
+
+CI 另有 ASan/UBSan 作业，关闭 MCAP 以检测项目自身代码。可在本地按以下方式运行：
+
+```bash
+cmake -S . -B build-sanitizers -DCMAKE_BUILD_TYPE=Debug \
+  -DROSBAGS_ENABLE_MCAP=OFF \
+  -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+cmake --build build-sanitizers -j2
+UBSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-sanitizers --output-on-failure
+```
+
+若运行环境使用 ptrace，LeakSanitizer 无法工作，可在构建（生成器也会运行）和 CTest 前设置 `ASAN_OPTIONS=detect_leaks=0`；此时只验证 ASan/UBSan，不能据此宣称通过了泄漏检测。外部 MCAP SDK 的代码需单独以 sanitizer 构建，才能获得完整的上游检测覆盖。

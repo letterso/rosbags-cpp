@@ -317,7 +317,7 @@ filter.topic_namespace = "/robot";  // 匹配 /robot/imu，不匹配 /imu
 检查溢出。`nanoseconds_to_microseconds()` 会向下取整，因而有意丢弃不足一微秒的
 余数；需要精确比较时应保留整数纳秒。
 
-### 4.4 增量游标和 ROS1 内存上限
+### 4.4 增量游标和资源上限
 
 `messages()` 返回只能移动的 `MessageCursor`，适合需要暂停、限速或自行管理读取节奏的应用；`read_raw()` 仍是等价的回调封装。
 
@@ -334,7 +334,40 @@ while (cursor.next(message)) {
 }
 ```
 
-ROS1 默认上限为 256 MiB，限制的是单个 chunk 的解压后大小；超过限制会抛出 `ResourceLimitError`，而不是尝试分配无界内存。`Reader` 和 `AnyReader` 的 cursor 都会共享持有内部状态，因此移动或销毁 reader 外壳不会使 cursor 失效；两类 cursor 都必须在显式 `close()` 前销毁。ROS1 为精确时间排序仍保存消息索引，因此极大消息数的索引内存不受这个选项限制。
+`Reader` 和 `AnyReader` 将 `ReaderOptions` 传给各后端。超限抛出 `ResourceLimitError`；声明长度超过实际文件或 payload 时抛出格式/解码错误。默认值如下：
+
+| 选项 | 默认值 | 约束 |
+| --- | --- | --- |
+| `max_rosbag1_chunk_bytes` | 256 MiB | 单个 ROS1 chunk 解压大小。 |
+| `max_mcap_chunk_bytes` | 256 MiB | 单个 MCAP chunk 解压大小；压缩 record 允许额外的元数据预算。 |
+| `max_rosbag1_header_bytes` | 1 MiB | ROS1 文件和 chunk 内单个 header。 |
+| `max_connection_body_bytes` | 16 MiB | ROS1 connection body、MCAP schema/channel/header/metadata record。 |
+| `max_index_bytes` | 256 MiB | ROS1 索引及 chunk 元数据；MCAP 文件索引记录总字节数、缺索引时排序项的容量分别受此限制。 |
+| `max_message_bytes` | 256 MiB | 原始单条 payload、zstd 消息解压输出；MCAP attachment record 也受此限制。 |
+| `max_decompressed_file_bytes` | 128 GiB | 每个文件级 zstd 解压输出。 |
+| `max_temporary_bytes` | 256 GiB | 一个 ROS2 目录的文件解压临时磁盘总量，或一个 MCAP 后端的缺索引 payload 临时文件。 |
+| `max_zstd_window_bytes` | 128 MiB | ROS2 文件/消息级 zstd 解压器窗口。 |
+
+文件级 zstd 使用固定 64 KiB 输入/输出缓冲，支持未知内容长度和拼接帧。所有分片仍在 `open()` 时解压；内存不保存完整解压文件，临时磁盘仍需容纳全部分片。失败和 `close()` 都清理临时文件。
+
+MCAP 有完整消息索引时使用 SDK 时间排序；缺消息索引、未分块或缺 summary 时扫描 payload 到临时文件，内存只保存 `(timestamp, offset, size, channel)` 排序项。相同 timestamp 按物理写入顺序输出。缺 statistics 的文件通过独立扫描恢复统计，保留有效消息索引，因此有有效索引时无需 payload 临时文件。空文件直接返回 EOF。
+
+这些限制约束单项缓冲或指定存储，不是进程 RSS 总上限。SDK/SQLite 的内部缓存、vector 扩容瞬时重叠、多个输入/cursor 和应用主动保留的消息仍会增加内存。MCAP SDK 可能同时保留时间范围重叠的多个 chunk；`AnyReader` 的选项按子 reader 生效，其总内存和临时磁盘需按输入数估算。超过排序索引预算的 MCAP 会明确失败，目前没有磁盘外部排序。
+
+两类 cursor 共享内部状态，移动或销毁 reader 外壳不会使 cursor 失效；显式 `close()` 前必须先销毁 cursor。`next()` 抛出读取错误后应销毁该 cursor，再重新创建读取流程。
+
+解码另有 `DecodeLimits`：默认每序列最多 16 Mi 个元素、对象和动态存储合计 256 MiB、消息嵌套深度 64。生成器和内置 profile 在 reserve 前检查元素最小 wire 大小、元素数、乘法溢出和共享存储预算；ROS1 空消息元素允许零 wire 字节。预算统计请求的对象/元素/字符存储，不含 allocator 开销。
+
+```cpp
+rosbags::DecodeLimits limits;
+limits.max_sequence_elements = 1000000;
+limits.max_decoded_bytes = 64U * 1024U * 1024U;
+reader.read_decoded({}, registry, "ros2_humble", callback,
+                    rosbags::UnknownTypePolicy::Error, {}, limits);
+// decode(message, registry, profile, policy, warning, limits) 同样支持。
+```
+
+自定义 `TypeSupport<T>` 可用接收 `(ByteView, const DecodeLimits&)` 的 decoder 并通过序列化 reader 计费；旧的单参数 decoder 继续可用，但其内部资源分配由自定义实现负责，传入限制不会自动约束它。
 
 ### 4.5 内置类型解码
 
@@ -424,7 +457,9 @@ float64[3] position
 float32[] samples
 ```
 
-支持基本数值类型、`string`、定长数组、无界/有界序列和嵌套消息。ROS1 和 ROS2 生成器都会生成对应读取函数；实际读取时由消息连接的 `serialization_format` 选择 ROS1 或 CDR decoder。
+支持基本数值类型、`string`、`string<=N`、定长数组、无界/有界序列（如 `uint8[<=4]`）、ROS1 `time`/`duration` 和嵌套消息。界限在解码时校验。常量从字段名后的 `=` 识别；未知依赖、重复字段和未支持的默认值语法在生成时明确报错。ROS1 和 ROS2 生成器都会生成对应读取函数；实际读取时由消息连接的 `serialization_format` 选择 ROS1 或 CDR decoder。
+
+共享 C++ 表示为保留两种 wire 格式的完整数值范围做了调整：`byte` 和内置 `std_msgs::Byte::data` 使用 `int16_t`（ROS1 -128..127、ROS2 0..255），`ByteMultiArray::data` 为 `vector<int16_t>`；`Time::sec` 为 `int64_t`，`Duration::nanosec` 为 `int64_t`。ROS1 Time 的秒数按 uint32 读取，ROS1 Duration 的纳秒按 int32 读取；CDR 仍分别按 int32 秒和 uint32 纳秒读取。这些公共布局与旧版本不具备二进制兼容性，下游必须重新编译并重新生成消息头；依赖精确字段类型的源代码也需相应调整。
 
 ### 5.3 基础 IDL 示例
 
@@ -438,7 +473,7 @@ struct Status {
 };
 ```
 
-当前 IDL 解析器面向基础 `struct`、字段数组、`sequence<T>` 和常见 primitive 别名。完整 ROS IDL module、注解、常量以及 action/service 结构不应直接假设可以生成，需要先用实际定义做验证。
+当前 IDL 解析器支持单个无注解 `struct`、字段数组、`string<N>`、`sequence<T, N>` 和常见 primitive 别名，也支持 `sequence<string<N>, M>`。完整 module、注解、常量及多个 struct 会在生成时明确拒绝。
 
 ### 5.4 生成和接入
 

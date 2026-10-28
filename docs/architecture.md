@@ -110,8 +110,8 @@ flowchart TD
 2. 读取带长度前缀的 bag header，取得 `index_pos`、连接数和 chunk 数。
 3. 从 `index_pos` 读取 connection header；connection 数据体是字段序列本身，不再包含一层 header 长度。
 4. 读取每个 `CHUNK_INFO`，建立 chunk 位置、时间范围和 index record 数。
-5. 按 chunk 读取 `CHUNK` header 和 `IDXDATA`；文件内容不保留在内存，索引项紧凑保存时间戳、chunk 序号和消息偏移。
-6. cursor 以每连接一个堆项合并索引，按需 seek 并流式解压一个 chunk，跳过 chunk 内的 connection record，再校验目标记录是 `MSGDATA`。
+5. 校验文件剩余长度和索引预算，通过 `CHUNK_INFO` 总计数为每连接索引一次预留；读取 `CHUNK` header 和 `IDXDATA` 并核对实际计数。
+6. cursor 以每连接一个堆项合并索引，按需 seek 并流式解压一个 chunk，跳过 chunk 内的 connection record，再校验目标记录是 `MSGDATA`，且时间戳、connection ID 与索引一致。连接通过 ID 映射查找，替换 chunk 前释放旧缓冲。
 
 支持的 chunk 压缩为 `none`、`lz4`，以及在找到 BZip2 开发库时的 `bz2`。LZ4/BZip2 使用定长 I/O buffer 流式解压；默认 256 MiB 的解压上限可由 `ReaderOptions` 调整。ROS1 payload 原样返回；ROS1 内置 `Header` 解码包含 legacy `seq` 字段。
 
@@ -132,23 +132,25 @@ flowchart TD
 1. 校验 `rosbag2_bagfile_information`、metadata version 和 `storage_identifier`。
 2. 从 `topics_with_message_count` 建立目录级连接、QoS、类型摘要和计数。
 3. 根据 `relative_file_paths` 定位子文件；当前实现按 rosbag2 常见约定使用文件名部分。
-4. 为每个 SQLite 或 MCAP 子文件创建对应后端，并把后端连接定义补回目录连接。
-5. 读取时将子后端消息映射回目录连接，并应用 topic/时间过滤。
+4. 为每个 SQLite 或 MCAP 子文件创建对应后端，校验 topic/type、serialization format 和双方已有的摘要/定义；冲突或缺目录 topic 时在打开阶段失败。
+5. 通过打开时建立的连接映射将子后端消息映射回目录连接，并应用 topic/时间过滤。
 
 zstd 处理边界：
 
-- `compression_mode: file`：先解压到临时文件，再由 SQLite/MCAP 后端打开；
-- `compression_mode: message`：每条消息读取后解压 payload；
+- `compression_mode: file`：固定 64 KiB 输入/输出缓冲解压到安全创建的临时文件，再由 SQLite/MCAP 后端打开；限制单文件输出、目录临时磁盘总量和解压窗口；
+- `compression_mode: message`：每条消息读取后解压 payload，输出受单消息预算约束；
 - 其他 compression mode（包括 `storage`）当前会明确拒绝，避免把未解压数据交给底层后端后产生误导性的格式错误。
 
 ### 6.4 MCAP
 
 启用 MCAP 后，`McapBackend` 使用 SDK 的 `McapReader`：
 
-- `open()` 后读取 summary，必要时允许 SDK fallback scan；
+- SDK 分配前扫描容器 record 长度，检查 chunk、消息、元数据和索引预算；
+- 使用 `NoFallbackScan` 保留 summary 消息索引；统计缺失时用独立扫描器恢复统计；
 - 从 channels/schemas 生成 `Connection` 和 message definition；
 - 从 statistics 设置总消息数、起止时间和每 channel 计数；
-- `read_raw()` 使用 log-time order、topic predicate 和 `[start,end)` 时间选项；
+- 完整消息索引使用 SDK log-time order；缺索引时把 payload 扫描到受磁盘预算约束的临时文件，只在内存中排序受预算约束的紧凑索引，按 timestamp 和物理顺序交付消息；空文件直接 EOF；
+- 两条读取路径均执行 topic/connection 和 `[start,end)` 过滤；
 - SDK 的消息扫描错误通过 `FormatError` 返回。
 
 MCAP 依赖由 CMake 按 `ROSBAGS_MCAP_ROOT`、已安装 `mcap` 包、FetchContent `mcap_builder` 的顺序解析。目标链接和安装导出见 `CMakeLists.txt` 与 `cmake/rosbags_cppConfig.cmake.in`。
@@ -163,7 +165,7 @@ MCAP 依赖由 CMake 按 `ROSBAGS_MCAP_ROOT`、已安装 `mcap` 包、FetchConte
 
 - `Ros1Reader` 按 little-endian 读取标量，字符串为长度加字节，不做 CDR 对齐；
 - `CdrReader` 校验 4 字节 encapsulation header，识别端序；字段对齐基准从封装头之后开始；
-- 两种 reader 都在每次读取前检查剩余长度，`finish()` 要求 payload 恰好消费完；
+- 两种 reader 都在每次读取前检查剩余长度，`finish()` 要求 payload 恰好消费完；生成与内置读取器使用元素最小 wire 大小、`DecodeLimits` 和嵌套计费限制分配；`uint8[]` 检查后批量复制；
 - 不支持的 `serialization_format` 不会静默当作另一种格式处理。
 
 ### 7.3 `TypeRegistry` 与策略
@@ -196,7 +198,8 @@ MCAP 依赖由 CMake 按 `ROSBAGS_MCAP_ROOT`、已安装 `mcap` 包、FetchConte
 ## 10. 已知限制与后续扩展点
 
 - `AnyReader` 的内存随输入数量、每路当前 payload 和每个 ROS1 输入最近使用的一个 chunk 增长，而不是随总 payload 增长；大量超大并行输入仍应按任务拆分。
-- ROS1 不再整包载入内存；精确排序仍要求常驻 `IDXDATA` 索引，单个解压 chunk 受 `ReaderOptions::max_rosbag1_chunk_bytes` 约束。
+- ROS1 不再整包载入内存；精确排序仍要求常驻 `IDXDATA` 索引，索引/chunk/header 分别受 `ReaderOptions` 约束；这些是指定缓冲预算而非总 RSS 上限。
+- 无索引 MCAP 的内存索引超限时明确失败，暂未实现磁盘外部排序；所有选项按后端/子 reader 生效。
 - 当前没有 writer、转换器、ROS graph 发布器或动态类型支持加载器。
 - 基础 IDL 生成器不处理完整 IDL module、常量语义、注解和所有 ROS action/service 结构。
 - ROS1 读取要求 bag 已建立索引；未索引 bag 和加密 bag 当前不支持。
