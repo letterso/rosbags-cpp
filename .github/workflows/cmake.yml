@@ -10,7 +10,7 @@ jobs:
         mcap: ['ON', 'OFF']
         shared: ['ON', 'OFF']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libyaml-cpp-dev liblz4-dev libzstd-dev libbz2-dev pkg-config
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DROSBAGS_BUILD_TESTS=ON -DROSBAGS_BUILD_TOOLS=ON -DROSBAGS_ENABLE_MCAP=${{ matrix.mcap }} -DBUILD_SHARED_LIBS=${{ matrix.shared }}
       - run: cmake --build build -j2
@@ -21,7 +21,7 @@ jobs:
       ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
       UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libyaml-cpp-dev liblz4-dev libzstd-dev libbz2-dev pkg-config
       - run: cmake -S . -B build-sanitizers -DCMAKE_BUILD_TYPE=Debug -DROSBAGS_ENABLE_MCAP=OFF -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
       - run: cmake --build build-sanitizers -j2
