@@ -2,6 +2,29 @@
 
 本文件记录 `rosbags-cpp` 的版本更新。
 
+## [0.1.5] - 2026-10-28
+
+### 修复
+
+- 修复 SQLite 仅时间过滤时参数错位，以及 uint64 时间边界转换为 int64 后回绕的问题；元数据查询改用 statement RAII，并检查扫描结束状态。
+- ROS1 同时校验索引与 MSGDATA 的时间戳、连接 ID；对 header、connection、chunk/index 数量与文件剩余长度执行分配前校验。
+- ROS2 目录在打开时验证分片 topic/type、编码和已有摘要/定义，避免目录 metadata 覆盖真实编码。
+- 修复 `.msg` 有界序列被当作常量丢弃、ROS1 time/duration 引用无法编译，以及合法空消息序列被拒绝的问题；实现有界字符串，并明确拒绝未支持的 IDL 布局与未知字段类型。
+- MCAP 有效消息索引保留 SDK 时间排序，缺索引时扫描到受预算约束的 payload 临时文件及内存排序索引；缺统计记录不会破坏有效索引，空文件正常返回 EOF。
+- 文件级 zstd 改为固定缓冲流式解压到临时文件，支持未知长度和拼接帧，限制输出、临时磁盘及窗口，并在失败时清理。
+
+### 性能与资源限制
+
+- ROS1 根据校验后的 CHUNK_INFO 总计数一次预留索引，移除逐记录精确 reserve；四字节索引读取使用栈缓冲，替换 chunk 前释放旧缓冲。
+- ROS1、MCAP 和目录连接查找使用打开时建立的映射；内置及生成的 uint8 序列在检查后批量复制。
+- 增加后端 `ReaderOptions` 和解码 `DecodeLimits`，在 reserve 前校验元素最小 wire 成本、元素数、存储大小和嵌套深度。旧单参数自定义 decoder 保持可用，其内部资源限制由实现负责。
+
+### 兼容性与验证
+
+- 共享 byte 表示改为 int16_t，ByteMultiArray 改为 vector<int16_t>；Time.sec 与 Duration.nanosec 改为 int64_t，保留 ROS1/ROS2 各自的完整数值范围。公共对象布局与旧库不具备二进制兼容性，下游须重新编译并重新生成消息头。
+- 增加查询、损坏输入、生成代码实际解码、MCAP 兼容性、zstd 预算和清理回归，以及 ASan/UBSan CI 作业。
+- 优先链接 yaml-cpp::yaml-cpp，并兼容旧 yaml-cpp target。
+
 ## [0.1.4] - 2026-09-09
 
 ### 新增
