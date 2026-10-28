@@ -149,8 +149,8 @@ struct Backend {
 };
 
 std::unique_ptr<Backend> make_rosbag1_backend(const std::string& path, ReaderOptions options);
-std::unique_ptr<Backend> make_sqlite_backend(const std::string& path);
-std::unique_ptr<Backend> make_directory_backend(const std::string& path);
-std::unique_ptr<Backend> make_mcap_backend(const std::string& path);
+std::unique_ptr<Backend> make_sqlite_backend(const std::string& path, ReaderOptions options);
+std::unique_ptr<Backend> make_directory_backend(const std::string& path, ReaderOptions options);
+std::unique_ptr<Backend> make_mcap_backend(const std::string& path, ReaderOptions options);
 
 }  // namespace rosbags::internal

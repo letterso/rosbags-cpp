@@ -371,6 +371,13 @@ TEST_CASE("rejects truncated unknown-size zstd message frames" * doctest::test_s
   CHECK(count == 1);
   reader.close();
 
+  rosbags::ReaderOptions output_limit;
+  output_limit.max_message_bytes = 64 * 1024;
+  rosbags::Reader limited(directory.string(), output_limit);
+  limited.open();
+  CHECK_THROWS_AS(limited.read_raw({}, [](const rosbags::Message&) {}), rosbags::ResourceLimitError);
+  limited.close();
+
   compressed.pop_back();
   REQUIRE(sqlite3_open(path.c_str(), &database) == SQLITE_OK);
   sqlite3_stmt* update = nullptr;
@@ -844,3 +851,423 @@ TEST_CASE("MCAP filtering preserves name policy and source context" * doctest::t
   CHECK_FALSE(cursor.next(message));
 }
 #endif
+
+TEST_CASE("SQLite time filters bind precisely and preserve unsigned boundaries" * doctest::test_suite("project")) {
+  const auto path = temp_path("_ranges.db3");
+  sqlite3* database = nullptr;
+  REQUIRE(sqlite3_open(path.c_str(), &database) == SQLITE_OK);
+  REQUIRE(sqlite3_exec(database,
+      "CREATE TABLE topics(id INTEGER PRIMARY KEY,name TEXT,type TEXT,serialization_format TEXT);"
+      "CREATE TABLE messages(id INTEGER PRIMARY KEY,topic_id INTEGER,timestamp INTEGER,data BLOB);"
+      "INSERT INTO topics VALUES(1,'/sensor','test/M','cdr');"
+      "INSERT INTO messages VALUES(1,1,10,X'00'),(2,1,20,X'00'),(3,1,9223372036854775807,X'00');",
+      nullptr, nullptr, nullptr) == SQLITE_OK);
+  sqlite3_close(database);
+  rosbags::Reader reader(path.string());
+  reader.open();
+  const auto maximum = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+  for (int selection = 0; selection != 3; ++selection) {
+    rosbags::ReadFilter filter;
+    if (selection == 1) filter.topics = {"/sensor"};
+    if (selection == 2) filter.connection_ids = {1};
+    const auto query = [&] {
+      std::vector<std::uint64_t> result;
+      reader.read_raw(filter, [&](const auto& message) { result.push_back(message.timestamp); });
+      return result;
+    };
+    filter.start = 15;
+    CHECK(query() == std::vector<std::uint64_t>{20, maximum});
+    filter.start.reset(); filter.stop = 15;
+    CHECK(query() == std::vector<std::uint64_t>{10});
+    filter.start = 10; filter.stop = 20;
+    CHECK(query() == std::vector<std::uint64_t>{10});
+    filter.start = 20; filter.stop = 10;
+    CHECK(query().empty());
+    filter.start = maximum; filter.stop = maximum + 1;
+    CHECK(query() == std::vector<std::uint64_t>{maximum});
+    filter.start = maximum + 1;
+    CHECK(query().empty());
+    filter.start.reset(); filter.stop = std::numeric_limits<std::uint64_t>::max();
+    CHECK(query() == std::vector<std::uint64_t>{10,20,maximum});
+    filter.stop = 0;
+    CHECK(query().empty());
+  }
+}
+
+TEST_CASE("ROS2 directory validates metadata against every storage connection" * doctest::test_suite("project")) {
+  const auto directory = temp_path("_connection_validation");
+  std::filesystem::create_directories(directory);
+  const auto path = directory / "storage.db3";
+  sqlite3* database = nullptr;
+  REQUIRE(sqlite3_open(path.c_str(), &database) == SQLITE_OK);
+  REQUIRE(sqlite3_exec(database,
+      "CREATE TABLE topics(id INTEGER PRIMARY KEY,name TEXT,type TEXT,serialization_format TEXT);"
+      "CREATE TABLE messages(id INTEGER PRIMARY KEY,topic_id INTEGER,timestamp INTEGER,data BLOB);"
+      "INSERT INTO topics VALUES(1,'/text','std_msgs/msg/String','cdr');"
+      "INSERT INTO messages VALUES(1,1,10,X'000100000100000000');",
+      nullptr,nullptr,nullptr) == SQLITE_OK);
+  sqlite3_close(database);
+  const auto metadata = [&](std::string_view format, std::string_view type) {
+    std::ofstream output(directory / "metadata.yaml");
+    output << "rosbag2_bagfile_information:\n  version: 9\n  storage_identifier: sqlite3\n"
+           << "  relative_file_paths: [storage.db3]\n  message_count: 1\n"
+           << "  topics_with_message_count:\n    - topic_metadata:\n        name: /text\n"
+           << "        type: " << type << "\n        serialization_format: " << format << "\n"
+           << "      message_count: 1\n";
+  };
+  metadata("ros1", "std_msgs/msg/String");
+  rosbags::Reader reader(directory.string());
+  CHECK_THROWS_AS(reader.open(), rosbags::FormatError);
+  CHECK_FALSE(reader.is_open());
+  metadata("cdr", "std_msgs/msg/UInt32");
+  CHECK_THROWS_AS(reader.open(), rosbags::FormatError);
+  metadata("cdr", "std_msgs/msg/String");
+  reader.open();
+  rosbags::ReadFilter filter; filter.connection_ids={reader.connections().front().id};
+  std::size_t count=0;
+  reader.read_raw(filter, [&](const auto& message) {
+    CHECK(message.connection->serialization_format == "cdr"); ++count;
+  });
+  CHECK(count==1);
+}
+
+TEST_CASE("ROS1 rejects index entries for a different connection at the same timestamp" * doctest::test_suite("project")) {
+  const auto path = temp_path("_wrong_connection.bag");
+  const auto time = time_value(1, 0);
+  const auto message = record({{"op",u8(2)},{"conn",u32(1)},{"time",time}}, u32(42));
+  const auto chunk = record({{"op",u8(5)},{"compression",Bytes{'n','o','n','e'}},
+                             {"size",u32(static_cast<std::uint32_t>(message.size()))}}, message);
+  const auto index = record({{"op",u8(4)},{"ver",u32(1)},{"conn",u32(0)},{"count",u32(1)}}, [&] {
+    auto body=time; put32(body,0); return body;
+  }());
+  auto bag_header = header({{"op",u8(3)},{"index_pos",u64(4109+chunk.size()+index.size())},
+                            {"conn_count",u32(2)},{"chunk_count",u32(1)}});
+  put32(bag_header, static_cast<std::uint32_t>(4096-4-bag_header.size()));
+  bag_header.resize(4096, ' ');
+  std::ofstream output(path, std::ios::binary);
+  output << "#ROSBAG V2.0\n";
+  const auto write = [&](const Bytes& bytes) {
+    output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  };
+  write(bag_header); write(chunk); write(index);
+  for (unsigned id=0; id!=2; ++id) {
+    const std::string topic=id ? "/other" : "/wanted";
+    write(record({{"op",u8(7)},{"conn",u32(id)},{"topic",Bytes(topic.begin(),topic.end())}},
+                 serialized_fields({{"type",Bytes{'t','e','s','t','/','M'}}})));
+  }
+  write(record({{"op",u8(6)},{"ver",u32(1)},{"chunk_pos",u64(4109)},
+                {"start_time",time},{"end_time",time},{"count",u32(1)}}, [&] {
+    Bytes body; put32(body,0); put32(body,1); return body;
+  }()));
+  output.close();
+  rosbags::Reader reader(path.string()); reader.open();
+  rosbags::ReadFilter filter; filter.topics={"/wanted"};
+  CHECK_THROWS_AS(reader.read_raw(filter, [](const auto&) {}), rosbags::FormatError);
+}
+
+namespace {
+std::vector<std::string> temporary_files(std::string_view prefix) {
+  std::vector<std::string> paths;
+  for (const auto& entry : std::filesystem::directory_iterator(std::filesystem::temp_directory_path())) {
+    if (entry.path().filename().string().rfind(prefix,0)==0) paths.push_back(entry.path().string());
+  }
+  std::sort(paths.begin(),paths.end());
+  return paths;
+}
+
+Bytes compress_unknown_size(const Byte* data, std::size_t size) {
+  std::unique_ptr<ZSTD_CCtx,decltype(&ZSTD_freeCCtx)> ctx(ZSTD_createCCtx(),&ZSTD_freeCCtx);
+  REQUIRE(ctx);
+  REQUIRE(!ZSTD_isError(ZSTD_CCtx_setParameter(ctx.get(),ZSTD_c_contentSizeFlag,0)));
+  Bytes result(ZSTD_compressBound(size));
+  const auto count=ZSTD_compress2(ctx.get(),result.data(),result.size(),data,size);
+  REQUIRE(!ZSTD_isError(count));
+  result.resize(count);
+  return result;
+}
+}
+
+TEST_CASE("streams concatenated zstd storage with bounded output and cleanup" * doctest::test_suite("project")) {
+  const auto directory=temp_path("_stream_zstd");
+  std::filesystem::create_directories(directory);
+  const auto raw=directory/"raw.db3";
+  sqlite3* db=nullptr;
+  REQUIRE(sqlite3_open(raw.c_str(),&db)==SQLITE_OK);
+  REQUIRE(sqlite3_exec(db,
+      "CREATE TABLE topics(id INTEGER PRIMARY KEY,name TEXT,type TEXT,serialization_format TEXT);"
+      "CREATE TABLE messages(id INTEGER PRIMARY KEY,topic_id INTEGER,timestamp INTEGER,data BLOB);"
+      "INSERT INTO topics VALUES(1,'/bytes','test/Bytes','cdr');",nullptr,nullptr,nullptr)==SQLITE_OK);
+  Bytes payload(512*1024);
+  for (std::size_t i=0;i<payload.size();++i) payload[i]=static_cast<Byte>(i*17);
+  sqlite3_stmt* insert=nullptr;
+  REQUIRE(sqlite3_prepare_v2(db,"INSERT INTO messages VALUES(1,1,42,?)",-1,&insert,nullptr)==SQLITE_OK);
+  REQUIRE(sqlite3_bind_blob(insert,1,payload.data(),static_cast<int>(payload.size()),SQLITE_TRANSIENT)==SQLITE_OK);
+  REQUIRE(sqlite3_step(insert)==SQLITE_DONE);
+  sqlite3_finalize(insert); sqlite3_close(db);
+  std::ifstream input(raw,std::ios::binary);
+  const Bytes file((std::istreambuf_iterator<char>(input)),std::istreambuf_iterator<char>());
+  input.close();
+  auto compressed=compress_unknown_size(file.data(),file.size()/2);
+  auto second=compress_unknown_size(file.data()+file.size()/2,file.size()-file.size()/2);
+  compressed.insert(compressed.end(),second.begin(),second.end());
+  const auto write_compressed=[&] {
+    std::ofstream output(directory/"bag.db3.zstd",std::ios::binary);
+    output.write(reinterpret_cast<const char*>(compressed.data()),compressed.size());
+  };
+  const auto write_metadata=[&](bool two_files) {
+    std::ofstream output(directory/"metadata.yaml");
+    output << "rosbag2_bagfile_information:\n"
+           << "  version: 5\n  storage_identifier: sqlite3\n"
+           << "  relative_file_paths: [bag.db3.zstd" << (two_files ? ", bag.db3.zstd" : "") << "]\n"
+           << "  starting_time: {nanoseconds_since_epoch: 42}\n  duration: {nanoseconds: 0}\n"
+           << "  message_count: " << (two_files ? 2 : 1) << "\n"
+           << "  compression_format: zstd\n  compression_mode: file\n"
+           << "  topics_with_message_count:\n    - topic_metadata:\n"
+           << "        name: /bytes\n        type: test/Bytes\n        serialization_format: cdr\n"
+           << "      message_count: " << (two_files ? 2 : 1) << "\n";
+  };
+  write_compressed(); write_metadata(false);
+  const auto before=temporary_files("rosbags_cpp_");
+  {
+    rosbags::ReaderOptions limits;
+    limits.max_decompressed_file_bytes=file.size(); limits.max_temporary_bytes=file.size();
+    rosbags::Reader reader(directory.string(),limits);
+    reader.open();
+    CHECK(temporary_files("rosbags_cpp_").size()==before.size()+1);
+    std::size_t count=0;
+    reader.read_raw({},[&](const auto& message) { CHECK(*message.bytes==payload); CHECK(message.timestamp==42); ++count; });
+    CHECK(count==1);
+    reader.close();
+  }
+  CHECK(temporary_files("rosbags_cpp_")==before);
+  for (int budget=0;budget!=3;++budget) {
+    rosbags::ReaderOptions limits;
+    if (budget==0) limits.max_decompressed_file_bytes=file.size()-1;
+    if (budget==1) limits.max_temporary_bytes=file.size()-1;
+    if (budget==2) limits.max_zstd_window_bytes=1024;
+    rosbags::Reader reader(directory.string(),limits);
+    CHECK_THROWS_AS(reader.open(),rosbags::ResourceLimitError);
+    CHECK_FALSE(reader.is_open());
+    CHECK(temporary_files("rosbags_cpp_")==before);
+  }
+  write_metadata(true);
+  rosbags::ReaderOptions aggregate;
+  aggregate.max_temporary_bytes=file.size()*2-1;
+  rosbags::Reader multiple(directory.string(),aggregate);
+  CHECK_THROWS_AS(multiple.open(),rosbags::ResourceLimitError);
+  CHECK(temporary_files("rosbags_cpp_")==before);
+  write_metadata(false);
+  compressed.pop_back(); write_compressed();
+  rosbags::Reader truncated(directory.string());
+  CHECK_THROWS_AS(truncated.open(),rosbags::FormatError);
+  CHECK(temporary_files("rosbags_cpp_")==before);
+  compressed.clear(); write_compressed();
+  CHECK_THROWS_AS(truncated.open(),rosbags::FormatError);
+  CHECK(temporary_files("rosbags_cpp_")==before);
+}
+
+#if ROSBAGS_HAS_MCAP
+namespace {
+void write_mcap_variant(const std::filesystem::path& path,int variant,bool empty=false) {
+  mcap::McapWriterOptions options("ros2");
+  options.noMessageIndex=variant==1;
+  options.noChunking=variant==2;
+  options.noStatistics=variant==3;
+  options.noSummary=variant==4;
+  options.noRepeatedChannels=variant==5;
+  options.noRepeatedSchemas=variant==6;
+  options.chunkSize=1; // Force multiple chunks and timestamp overlap.
+  mcap::McapWriter writer;
+  REQUIRE(writer.open(path.string(),options).ok());
+  mcap::Schema schema("test/msg/Byte","ros2msg","uint8 data"); writer.addSchema(schema);
+  mcap::Channel channel("/sensor","cdr",schema.id); writer.addChannel(channel);
+  if (!empty) {
+    const std::array<std::uint64_t,4> times{20,10,10,30};
+    for (std::size_t i=0;i<times.size();++i) {
+      const Byte payload=static_cast<Byte>(i);
+      mcap::Message message{}; message.channelId=channel.id;
+      message.logTime=message.publishTime=times[i];
+      message.data=reinterpret_cast<const std::byte*>(&payload); message.dataSize=1;
+      REQUIRE(writer.write(message).ok());
+    }
+  }
+  writer.close();
+}
+}
+TEST_CASE("MCAP variants sort timestamps preserve ties and merge correctly" * doctest::test_suite("project")) {
+  for (int variant=0;variant!=7;++variant) {
+    CAPTURE(variant);
+    const auto path=temp_path("_variant.mcap"); write_mcap_variant(path,variant);
+    const auto before=temporary_files("rosbags_mcap_");
+    rosbags::Reader reader(path.string()); reader.open();
+    CHECK(reader.metadata().message_count==4);
+    CHECK(reader.connections().front().type=="test/msg/Byte");
+    std::vector<std::uint64_t> times;
+    std::vector<Byte> values;
+    reader.read_raw({},[&](const auto& message) {
+      times.push_back(message.timestamp); values.push_back(message.bytes->at(0));
+      CHECK(message.source_path==path.string());
+    });
+    CHECK(times==std::vector<std::uint64_t>{10,10,20,30});
+    CHECK(values==std::vector<Byte>{1,2,0,3});
+    rosbags::ReadFilter filter; filter.start=10; filter.stop=20;
+    filter.connection_ids={reader.connections().front().id};
+    values.clear();
+    reader.read_raw(filter,[&](const auto& message) { values.push_back(message.bytes->at(0)); });
+    CHECK(values==std::vector<Byte>{1,2});
+    filter.topics={"/missing"};
+    rosbags::Message message;
+    CHECK_FALSE(reader.messages(filter).next(message));
+    filter.topics.clear(); filter.start=20; filter.stop=10;
+    CHECK_FALSE(reader.messages(filter).next(message));
+    reader.close();
+    CHECK(temporary_files("rosbags_mcap_")==before);
+    const auto empty=temp_path("_empty.mcap"); write_mcap_variant(empty,variant,true);
+    rosbags::Reader empty_reader(empty.string()); empty_reader.open();
+    CHECK(empty_reader.metadata().message_count==0);
+    CHECK_FALSE(empty_reader.messages().next(message));
+    const auto other=temp_path("_other.mcap"); write_mcap_variant(other,0);
+    rosbags::AnyReader merged({path.string(),other.string()}); merged.open();
+    times.clear();
+    merged.read_raw({},[&](const auto& msg) { times.push_back(msg.timestamp); });
+    CHECK(times==std::vector<std::uint64_t>{10,10,10,10,20,20,30,30});
+  }
+}
+TEST_CASE("MCAP rejects chunk index message and temporary budgets before allocation" * doctest::test_suite("project")) {
+  const auto path=temp_path("_budget.mcap"); write_mcap_variant(path,1);
+  const auto before=temporary_files("rosbags_mcap_");
+  for (int kind=0;kind!=4;++kind) {
+    rosbags::ReaderOptions options;
+    if (kind==0) options.max_mcap_chunk_bytes=1;
+    if (kind==1) options.max_index_bytes=1;
+    if (kind==2) options.max_message_bytes=0;
+    if (kind==3) options.max_temporary_bytes=3;
+    rosbags::Reader reader(path.string(),options);
+    CHECK_THROWS_AS(reader.open(),rosbags::ResourceLimitError);
+    CHECK_FALSE(reader.is_open());
+    CHECK(temporary_files("rosbags_mcap_")==before);
+  }
+  // Valid indexed files need no payload spool, even when statistics are omitted.
+  const auto indexed=temp_path("_indexed.mcap"); write_mcap_variant(indexed,3);
+  rosbags::ReaderOptions options; options.max_temporary_bytes=0;
+  rosbags::Reader reader(indexed.string(),options); reader.open();
+  std::size_t count=0;
+  reader.read_raw({},[&](const auto&) { ++count; });
+  CHECK(count==4);
+  CHECK(temporary_files("rosbags_mcap_")==before);
+}
+#endif
+
+TEST_CASE("builtins retain ROS1 signed bytes and full time ranges" * doctest::test_suite("project")) {
+  rosbags::TypeRegistry registry;
+  rosbags::profiles::register_builtin_types(registry,"ros1_noetic");
+  rosbags::profiles::register_builtin_types(registry,"ros2_humble");
+  rosbags::Connection connection;
+  const auto decode=[&](Bytes payload,bool cdr) {
+    connection.serialization_format=cdr ? "cdr" : "ros1";
+    rosbags::Message message{std::make_shared<Bytes>(std::move(payload)),0,&connection};
+    return rosbags::decode(message,registry,cdr ? "ros2_humble" : "ros1_noetic",rosbags::UnknownTypePolicy::Error);
+  };
+  connection.type="std_msgs/Byte";
+  for (const Byte value : {Byte{128},Byte{255},Byte{0},Byte{127}}) {
+    const auto ros1=decode(Bytes{value},false);
+    CHECK(ros1->as<rosbags::profiles::std_msgs::Byte>().data==static_cast<std::int8_t>(value));
+    const auto ros2=decode(Bytes{0,1,0,0,value},true);
+    CHECK(ros2->as<rosbags::profiles::std_msgs::Byte>().data==value);
+  }
+  connection.type="std_msgs/ByteMultiArray";
+  Bytes array; put32(array,0); put32(array,0); put32(array,4); array.insert(array.end(),{128,255,0,127});
+  CHECK(decode(array,false)->as<rosbags::profiles::std_msgs::ByteMultiArray>().data==std::vector<std::int16_t>{-128,-1,0,127});
+  array.insert(array.begin(),{0,1,0,0});
+  CHECK(decode(array,true)->as<rosbags::profiles::std_msgs::ByteMultiArray>().data==std::vector<std::int16_t>{128,255,0,127});
+  connection.type="std_msgs/Time";
+  Bytes time; put32(time,0xffffffffU); put32(time,42);
+  CHECK(decode(time,false)->as<rosbags::profiles::std_msgs::Time>().data.sec==4294967295LL);
+  time.insert(time.begin(),{0,1,0,0});
+  rosbags::serialization::CdrReader time_reader({time.data(),time.size()});
+  rosbags::profiles::Time decoded_time;
+  rosbags::profiles::detail::read_cdr(time_reader,decoded_time);
+  CHECK(decoded_time.sec==-1);
+  connection.type="std_msgs/Duration";
+  Bytes duration; put32(duration,0xffffffffU); put32(duration,0xffffffffU);
+  CHECK(decode(duration,false)->as<rosbags::profiles::std_msgs::Duration>().data.nanosec==-1);
+  duration.insert(duration.begin(),{0,1,0,0});
+  rosbags::serialization::CdrReader duration_reader({duration.data(),duration.size()});
+  rosbags::profiles::Duration decoded_duration;
+  rosbags::profiles::detail::read_cdr(duration_reader,decoded_duration);
+  CHECK(decoded_duration.nanosec==4294967295LL);
+}
+
+TEST_CASE("builtin sequences and decoded callbacks enforce independent budgets" * doctest::test_suite("project")) {
+  rosbags::TypeRegistry registry;
+  rosbags::profiles::register_builtin_types(registry,"ros1_noetic");
+  const auto* support=registry.find("ros1_noetic","std_msgs/UInt64MultiArray");
+  REQUIRE(support);
+  Bytes malformed; put32(malformed,0); put32(malformed,0); put32(malformed,65536);
+  malformed.resize(malformed.size()+65536,0); // Count fits byte length but elements do not.
+  CHECK_THROWS_AS(support->deserialize_ros1({malformed.data(),malformed.size()}),rosbags::DecodeError);
+  Bytes valid; put32(valid,0); put32(valid,0); put32(valid,3); put64(valid,1); put64(valid,2); put64(valid,3);
+  rosbags::DecodeLimits limits;
+  limits.max_sequence_elements=2;
+  CHECK_THROWS_AS(support->deserialize_ros1({valid.data(),valid.size()},limits),rosbags::ResourceLimitError);
+  limits={}; limits.max_decoded_bytes=sizeof(rosbags::profiles::std_msgs::UInt64MultiArray)+3*sizeof(std::uint64_t)-1;
+  CHECK_THROWS_AS(support->deserialize_ros1({valid.data(),valid.size()},limits),rosbags::ResourceLimitError);
+  limits={}; limits.max_decoded_bytes=sizeof(rosbags::profiles::std_msgs::UInt64MultiArray)+3*sizeof(std::uint64_t);
+  CHECK_NOTHROW(support->deserialize_ros1({valid.data(),valid.size()},limits));
+  const auto path=temp_path("_decode_budget.bag"); write_ros1_bag(path,{{{42,u32(7)}}});
+  // A custom limited decoder also receives the limit through Reader and AnyReader.
+  auto custom=std::make_shared<const rosbags::TypeSupport<std::uint32_t>>("test/M","test",
+      [](rosbags::ByteView bytes,const rosbags::DecodeLimits& budget) {
+        rosbags::serialization::Ros1Reader reader(bytes,budget); reader.account_allocation(sizeof(std::uint32_t));
+        const auto value=reader.u32(); reader.finish(); return value;
+      },[](rosbags::ByteView,const rosbags::DecodeLimits&) { return 0U; });
+  registry.register_type(custom);
+  limits.max_decoded_bytes=3;
+  rosbags::Reader reader(path.string()); reader.open();
+  CHECK_THROWS_AS(reader.read_decoded({},registry,"test",[](const auto&,const auto&) {},rosbags::UnknownTypePolicy::Error,{},limits),rosbags::ResourceLimitError);
+  rosbags::AnyReader any({path.string()}); any.open();
+  CHECK_THROWS_AS(any.read_decoded({},registry,"test",[](const auto&,const auto&) {},rosbags::UnknownTypePolicy::Error,{},limits),rosbags::ResourceLimitError);
+}
+
+TEST_CASE("ROS1 lengths and counts fail before untrusted allocations" * doctest::test_suite("project")) {
+  const auto path=temp_path("_resource.bag"); write_ros1_bag(path,{{{42,u32(7)}}});
+  for (int budget=0;budget!=3;++budget) {
+    rosbags::ReaderOptions options;
+    if (budget==0) options.max_rosbag1_header_bytes=1;
+    if (budget==1) options.max_connection_body_bytes=1;
+    if (budget==2) options.max_index_bytes=1;
+    rosbags::Reader reader(path.string(),options);
+    CHECK_THROWS_AS(reader.open(),rosbags::ResourceLimitError);
+    CHECK_FALSE(reader.is_open());
+  }
+  rosbags::ReaderOptions options; options.max_message_bytes=3;
+  rosbags::Reader reader(path.string(),options); reader.open();
+  rosbags::Message message;
+  CHECK_THROWS_AS(reader.messages().next(message),rosbags::ResourceLimitError);
+  reader.close();
+  // A tiny file claiming a 4 GiB header must report a format error, not allocate it.
+  std::ofstream output(path,std::ios::binary|std::ios::trunc);
+  output << "#ROSBAG V2.0\n";
+  const auto giant=u32(0xffffffffU);
+  output.write(reinterpret_cast<const char*>(giant.data()),giant.size()); output.close();
+  options={}; options.max_rosbag1_header_bytes=std::numeric_limits<std::size_t>::max();
+  rosbags::Reader malformed(path.string(),options);
+  CHECK_THROWS_AS(malformed.open(),rosbags::FormatError);
+  CHECK_FALSE(malformed.is_open());
+}
+
+TEST_CASE("codegen rejects unsupported or unresolved layouts explicitly" * doctest::test_suite("project")) {
+  const auto package=temp_path("_invalid_codegen"); std::filesystem::create_directories(package/"msg");
+  rosbags::codegen::GenerateOptions options;
+  options.profile="ros2_humble"; options.inputs={package.string()}; options.output_directory=(package/"output").string();
+  for (const std::string source : {"struct Invalid { @key uint32 data; };", "module x { struct Invalid { uint32 data; }; };",
+                                 "struct Invalid { const uint32 x = 3; uint32 data; };", "struct Invalid { malformed; };"}) {
+    std::ofstream file(package/"msg"/"Invalid.idl"); file << source; file.close();
+    CHECK_THROWS_AS(rosbags::codegen::generate(options),rosbags::RosbagsError);
+  }
+  std::filesystem::remove(package/"msg"/"Invalid.idl");
+  for (const std::string source : {"Missing data\n", "uint8[<=bad] data\n", "uint8[4]junk data\n", "uint8 data\nuint8 data\n"}) {
+    std::ofstream file(package/"msg"/"Invalid.msg"); file << source; file.close();
+    CHECK_THROWS_AS(rosbags::codegen::generate(options),rosbags::RosbagsError);
+  }
+}

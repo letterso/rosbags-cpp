@@ -7,8 +7,20 @@
 #include <limits>
 #include <string>
 #include <vector>
+#include <type_traits>
 
 namespace rosbags::serialization {
+
+// Minimum wire bytes per element, excluding alignment padding. Unknown custom
+// supports use independent element/storage limits instead of guessing a size.
+template <typename T> struct WireMinimum {
+  static constexpr std::size_t ros1 = std::is_arithmetic_v<T> ? sizeof(T) : 0;
+  static constexpr std::size_t cdr = ros1;
+};
+template <> struct WireMinimum<std::string> {
+  static constexpr std::size_t ros1 = 4;
+  static constexpr std::size_t cdr = 5;
+};
 
 inline std::uint16_t load16(const Byte* data, bool little) {
   return little ? static_cast<std::uint16_t>(data[0] | (data[1] << 8U))
@@ -31,7 +43,9 @@ inline double float64(std::uint64_t value) { double result{}; std::memcpy(&resul
 
 class ReaderBase {
  public:
-  explicit ReaderBase(ByteView bytes) : bytes_(bytes) {}
+  explicit ReaderBase(ByteView bytes, DecodeLimits limits = {}) : bytes_(bytes), limits_(limits) {
+    if (bytes.size && !bytes.data) fail("serialized message has no data");
+  }
   std::size_t position() const noexcept { return position_; }
   std::size_t remaining() const noexcept { return bytes_.size - position_; }
   void require(std::size_t size) const {
@@ -39,7 +53,7 @@ class ReaderBase {
   }
   ByteView read_bytes(std::size_t size) {
     require(size);
-    const auto result = ByteView{bytes_.data + position_, size};
+    const auto result = ByteView{bytes_.data ? bytes_.data + position_ : nullptr, size};
     position_ += size;
     return result;
   }
@@ -47,6 +61,39 @@ class ReaderBase {
   void finish() const {
     if (position_ != bytes_.size) fail("serialized message has trailing bytes");
   }
+  void account_allocation(std::size_t bytes) {
+    if (bytes > limits_.max_decoded_bytes - allocated_)
+      throw ResourceLimitError("decoded storage exceeds max_decoded_bytes");
+    allocated_ += bytes;
+  }
+  void check_sequence(std::size_t count, std::size_t element_bytes, std::size_t minimum_wire_bytes) {
+    if (minimum_wire_bytes && count > remaining() / minimum_wire_bytes)
+      fail("sequence length exceeds serialized payload");
+    if (count > limits_.max_sequence_elements)
+      throw ResourceLimitError("sequence exceeds max_sequence_elements");
+    if (element_bytes && count > (limits_.max_decoded_bytes - allocated_) / element_bytes)
+      throw ResourceLimitError("decoded storage exceeds max_decoded_bytes");
+    account_allocation(count * element_bytes);
+  }
+  // The caller has already checked and charged the sequence's storage.
+  void read_byte_values(std::vector<std::uint8_t>& values, std::size_t count) {
+    const auto bytes = read_bytes(count);
+    if (!count) { values.clear(); return; }
+    values.assign(bytes.data, bytes.data + count);
+  }
+  class NestingGuard {
+   public:
+    explicit NestingGuard(ReaderBase& reader) : reader_(reader) {
+      if (reader_.depth_ >= reader_.limits_.max_nesting_depth)
+        throw ResourceLimitError("message exceeds max_nesting_depth");
+      ++reader_.depth_;
+    }
+    ~NestingGuard() { --reader_.depth_; }
+    NestingGuard(const NestingGuard&) = delete;
+    NestingGuard& operator=(const NestingGuard&) = delete;
+   private:
+    ReaderBase& reader_;
+  };
  protected:
   [[noreturn]] void fail(const char* reason) const {
     DecodeError error(reason);
@@ -57,11 +104,14 @@ class ReaderBase {
   }
   ByteView bytes_;
   std::size_t position_ = 0;
+  DecodeLimits limits_;
+  std::size_t allocated_ = 0;
+  std::size_t depth_ = 0;
 };
 
 class Ros1Reader final : public ReaderBase {
  public:
-  explicit Ros1Reader(ByteView bytes) : ReaderBase(bytes) {}
+  explicit Ros1Reader(ByteView bytes, DecodeLimits limits = {}) : ReaderBase(bytes, limits) {}
   std::uint8_t u8() { return read_bytes(1)[0]; }
   std::int8_t i8() { return static_cast<std::int8_t>(u8()); }
   std::uint16_t u16() { return load16(read_bytes(2).data, true); }
@@ -73,17 +123,22 @@ class Ros1Reader final : public ReaderBase {
   float f32() { return float32(u32()); }
   double f64() { return float64(u64()); }
   bool boolean() { return u8() != 0; }
-  std::string string() {
+  std::string string(std::size_t bound = std::numeric_limits<std::size_t>::max()) {
     const auto size = u32();
+    if (size > bound) fail("bounded string exceeds declared capacity");
     if (size > std::numeric_limits<std::size_t>::max()) throw DecodeError("ROS1 string is too large");
     const auto bytes = read_bytes(static_cast<std::size_t>(size));
-    return std::string(reinterpret_cast<const char*>(bytes.data), bytes.size);
+    if (bytes.size == std::numeric_limits<std::size_t>::max())
+      throw ResourceLimitError("string allocation size overflows");
+    account_allocation(bytes.size + 1);
+    return bytes.size ? std::string(reinterpret_cast<const char*>(bytes.data), bytes.size) : std::string{};
   }
+  std::string bounded_string(std::size_t bound) { return string(bound); }
 };
 
 class CdrReader final : public ReaderBase {
  public:
-  explicit CdrReader(ByteView bytes) : ReaderBase(bytes) {
+  explicit CdrReader(ByteView bytes, DecodeLimits limits = {}) : ReaderBase(bytes, limits) {
     if (bytes.size < 4 || bytes.data[0] != 0) fail("invalid CDR encapsulation");
     if (bytes.data[1] != 0 && bytes.data[1] != 1) fail("invalid CDR byte order");
     little_ = bytes.data[1] == 1;
@@ -105,12 +160,15 @@ class CdrReader final : public ReaderBase {
   float f32() { return float32(u32()); }
   double f64() { return float64(u64()); }
   bool boolean() { return u8() != 0; }
-  std::string string() {
+  std::string string(std::size_t bound = std::numeric_limits<std::size_t>::max()) {
     const auto size = u32();
+    if (size && static_cast<std::size_t>(size - 1) > bound) fail("bounded string exceeds declared capacity");
     const auto bytes = read_bytes(size);
-    if (size && bytes.data[size - 1] == 0) return std::string(reinterpret_cast<const char*>(bytes.data), size - 1);
-    return std::string(reinterpret_cast<const char*>(bytes.data), size);
+    if (!size || bytes.data[size - 1] != 0) fail("CDR string has no terminating NUL");
+    account_allocation(size);
+    return std::string(reinterpret_cast<const char*>(bytes.data), size - 1);
   }
+  std::string bounded_string(std::size_t bound) { return string(bound); }
   bool little_endian() const noexcept { return little_; }
  private:
   bool little_ = true;

@@ -35,7 +35,7 @@ std::string field_string(const Fields& fields, const char* name, bool required =
     if (required) throw FormatError(std::string("missing field ") + name);
     return {};
   }
-  return std::string(reinterpret_cast<const char*>(it->second.data()), it->second.size());
+  return it->second.empty() ? std::string{} : std::string(reinterpret_cast<const char*>(it->second.data()), it->second.size());
 }
 
 RecordHeader read_fields(ByteView input, std::size_t& pos, std::size_t end) {
@@ -57,13 +57,13 @@ RecordHeader read_fields(ByteView input, std::size_t& pos, std::size_t end) {
   return result;
 }
 
-Record read_record(ByteView input, std::size_t& pos, std::optional<std::uint8_t> expected = {}) {
+Record read_record(ByteView input, std::size_t& pos, std::size_t header_limit) {
   if (pos + 4 > input.size) throw FormatError("truncated rosbag header length");
   const auto header_size = u32(input.data + pos);
   pos += 4;
   if (header_size > input.size - pos) throw FormatError("rosbag header exceeds input");
+  if (header_size > header_limit) throw ResourceLimitError("ROS1 header exceeds max_rosbag1_header_bytes");
   const auto header = read_fields(input, pos, pos + header_size);
-  if (expected && field_u8(header.fields, "op") != *expected) throw FormatError("unexpected rosbag record opcode");
   if (pos + 4 > input.size) throw FormatError("truncated rosbag record size");
   const auto size = u32(input.data + pos);
   pos += 4;
@@ -75,7 +75,13 @@ Record read_record(ByteView input, std::size_t& pos, std::optional<std::uint8_t>
 
 std::uint64_t ros_time(const Bytes& value) {
   if (value.size() != 8) throw FormatError("invalid rosbag time field");
+  if (u32(value.data() + 4) >= 1000000000U) throw FormatError("invalid rosbag nanoseconds");
   return static_cast<std::uint64_t>(u32(value.data())) * 1000000000ULL + u32(value.data() + 4);
+}
+std::uint64_t field_time(const Fields& fields, const char* name) {
+  const auto it = fields.find(name);
+  if (it == fields.end()) throw FormatError(std::string("missing field ") + name);
+  return ros_time(it->second);
 }
 
 Bytes read_bytes(std::istream& input, std::size_t size, std::string_view what) {
@@ -85,17 +91,27 @@ Bytes read_bytes(std::istream& input, std::size_t size, std::string_view what) {
   return result;
 }
 std::uint32_t read_u32(std::istream& input, std::string_view what) {
-  const auto bytes = read_bytes(input, 4, what);
+  std::array<Byte,4> bytes{};
+  if (!input.read(reinterpret_cast<char*>(bytes.data()), 4)) throw FormatError("truncated ROS1 " + std::string(what));
   return u32(bytes.data());
 }
-RecordHeader read_header(std::istream& input) {
+void require_file_bytes(std::istream& input, std::uint64_t count, std::uint64_t file_size) {
+  const auto position = input.tellg();
+  if (position < 0 || static_cast<std::uint64_t>(position) > file_size ||
+      count > file_size - static_cast<std::uint64_t>(position)) throw FormatError("ROS1 declared length exceeds file");
+}
+RecordHeader read_header(std::istream& input, std::uint64_t file_size, std::size_t limit) {
   const auto size = read_u32(input, "header length");
+  require_file_bytes(input, size, file_size);
+  if (size > limit) throw ResourceLimitError("ROS1 header exceeds max_rosbag1_header_bytes");
   auto bytes = read_bytes(input, size, "header");
   std::size_t pos = 0;
   return read_fields(ByteView{bytes.data(), bytes.size()}, pos, bytes.size());
 }
-RecordHeader read_record_body_as_fields(std::istream& input) {
+RecordHeader read_record_body_as_fields(std::istream& input, std::uint64_t file_size, std::size_t limit) {
   const auto size = read_u32(input, "connection body length");
+  require_file_bytes(input, size, file_size);
+  if (size > limit) throw ResourceLimitError("ROS1 connection body exceeds max_connection_body_bytes");
   auto bytes = read_bytes(input, size, "connection body");
   std::size_t pos = 0;
   return read_fields(ByteView{bytes.data(), bytes.size()}, pos, bytes.size());
@@ -239,7 +255,7 @@ class Rosbag1Backend final : public Backend {
       if (!input) throw RosbagsError(context(path_, "cannot open file"));
       std::string magic;
       if (!std::getline(input, magic) || magic != "#ROSBAG V2.0") throw FormatError(context(path_, "unsupported ROS1 bag magic/version"));
-      const auto bag_header = read_header(input);
+      const auto bag_header = read_header(input, file_size_, options_.max_rosbag1_header_bytes);
       if (field_u8(bag_header.fields, "op") != 3) throw FormatError(context(path_, "expected BAGHEADER record"));
       const auto index_pos = field_u64(bag_header.fields, "index_pos");
       const auto connection_count = field_u32(bag_header.fields, "conn_count");
@@ -247,13 +263,19 @@ class Rosbag1Backend final : public Backend {
       if (!field_string(bag_header.fields, "encryptor", false).empty()) throw UnsupportedFeature(context(path_, "encrypted ROS1 bags are unsupported"));
       if (index_pos == 0) throw FormatError(context(path_, "ROS1 bag is not indexed"));
       seek(input, index_pos, file_size_, "index position");
+      if (connection_count > (file_size_ - index_pos) / 8 || chunk_count > (file_size_ - index_pos) / 8)
+        throw FormatError("ROS1 connection/chunk count exceeds file");
+      const auto chunk_bytes = sizeof(ChunkInfo) + sizeof(Chunk);
+      if (chunk_count > options_.max_index_bytes / chunk_bytes)
+        throw ResourceLimitError("ROS1 chunk metadata exceeds max_index_bytes");
+      std::size_t index_bytes = static_cast<std::size_t>(chunk_count) * chunk_bytes;
 
       for (std::uint32_t index = 0; index < connection_count; ++index) {
-        const auto first = read_header(input);
+        const auto first = read_header(input, file_size_, options_.max_rosbag1_header_bytes);
         if (field_u8(first.fields, "op") != 7) throw FormatError(context(path_, "expected CONNECTION record"));
         const auto connection_id = field_u32(first.fields, "conn");
         const auto raw_topic = field_string(first.fields, "topic");
-        const auto second = read_record_body_as_fields(input);
+        const auto second = read_record_body_as_fields(input, file_size_, options_.max_connection_body_bytes);
         Connection connection;
         connection.id = connection_id;
         connection.topic = normalize_topic(raw_topic);
@@ -264,33 +286,49 @@ class Rosbag1Backend final : public Backend {
         connection.serialization_format = "ros1";
         if (const auto caller = field_string(second.fields, "callerid", false); !caller.empty()) connection.callerid = caller;
         if (const auto latch = field_string(second.fields, "latching", false); !latch.empty()) connection.latching = std::stoi(latch);
+        if (!connection_positions_.emplace(connection_id, connections_.size()).second)
+          throw FormatError("duplicate ROS1 connection id");
         connections_.push_back(std::move(connection));
       }
 
+      std::unordered_map<std::uint32_t, std::size_t> expected_counts;
+      std::uint64_t expected_total = 0;
       chunk_infos_.reserve(chunk_count);
       for (std::uint32_t index = 0; index < chunk_count; ++index) {
-        const auto header = read_header(input);
+        const auto header = read_header(input, file_size_, options_.max_rosbag1_header_bytes);
         if (field_u8(header.fields, "op") != 6 || field_u32(header.fields, "ver") != 1)
           throw FormatError(context(path_, "invalid CHUNK_INFO record"));
         ChunkInfo info;
         info.position = field_u64(header.fields, "chunk_pos");
         info.index_record_count = field_u32(header.fields, "count");
-        info.start = info.index_record_count ? ros_time(header.fields.at("start_time")) : std::numeric_limits<std::uint64_t>::max();
-        info.end = info.index_record_count ? ros_time(header.fields.at("end_time")) + 1 : 0;
+        info.start = info.index_record_count ? field_time(header.fields, "start_time") : std::numeric_limits<std::uint64_t>::max();
+        info.end = info.index_record_count ? field_time(header.fields, "end_time") + 1 : 0;
         if (read_u32(input, "CHUNK_INFO body length") != static_cast<std::uint64_t>(info.index_record_count) * 8)
           throw FormatError(context(path_, "invalid CHUNK_INFO body size"));
+        require_file_bytes(input, static_cast<std::uint64_t>(info.index_record_count) * 8, file_size_);
+        if (info.index_record_count > connection_count) throw FormatError("CHUNK_INFO has too many connection records");
         for (std::uint32_t count = 0; count < info.index_record_count; ++count) {
-          (void)read_u32(input, "CHUNK_INFO connection id");
-          (void)read_u32(input, "CHUNK_INFO message count");
+          const auto id = read_u32(input, "CHUNK_INFO connection id");
+          const auto messages = read_u32(input, "CHUNK_INFO message count");
+          if (!find_connection(id) || messages > file_size_ / 12) throw FormatError("invalid CHUNK_INFO connection/count");
+          if (messages > file_size_ / 12 - expected_total)
+            throw FormatError("CHUNK_INFO total message count exceeds file");
+          expected_total += messages;
+          if (messages > (options_.max_index_bytes - index_bytes) / sizeof(IndexEntry))
+            throw ResourceLimitError("ROS1 indexes exceed max_index_bytes");
+          index_bytes += static_cast<std::size_t>(messages) * sizeof(IndexEntry);
+          expected_counts[id] += messages;
         }
         chunk_infos_.push_back(info);
       }
+
+      for (const auto& item : expected_counts) indexes_[item.first].reserve(item.second);
 
       chunks_.reserve(chunk_infos_.size());
       for (std::size_t chunk_index = 0; chunk_index < chunk_infos_.size(); ++chunk_index) {
         const auto& info = chunk_infos_[chunk_index];
         seek(input, info.position, file_size_, "chunk position");
-        const auto chunk_header = read_header(input);
+        const auto chunk_header = read_header(input, file_size_, options_.max_rosbag1_header_bytes);
         if (field_u8(chunk_header.fields, "op") != 5) throw FormatError(context(path_, "expected CHUNK record"));
         Chunk chunk;
         chunk.compression = field_string(chunk_header.fields, "compression");
@@ -300,23 +338,29 @@ class Rosbag1Backend final : public Backend {
         skip(input, chunk.compressed_size, file_size_, "chunk payload");
         chunks_.push_back(std::move(chunk));
         for (std::uint32_t record_index = 0; record_index < info.index_record_count; ++record_index) {
-          const auto index_header = read_header(input);
+          const auto index_header = read_header(input, file_size_, options_.max_rosbag1_header_bytes);
           if (field_u8(index_header.fields, "op") != 4 || field_u32(index_header.fields, "ver") != 1)
             throw FormatError(context(path_, "invalid IDXDATA record"));
           const auto count = field_u32(index_header.fields, "count");
           const auto connection = field_u32(index_header.fields, "conn");
           if (read_u32(input, "IDXDATA body length") != static_cast<std::uint64_t>(count) * 12)
             throw FormatError(context(path_, "invalid IDXDATA body size"));
-          auto& entries = indexes_[connection];
-          entries.reserve(entries.size() + count);
+          require_file_bytes(input, static_cast<std::uint64_t>(count) * 12, file_size_);
+          const auto expected = expected_counts.find(connection);
+          if (expected == expected_counts.end()) throw FormatError("IDXDATA references unknown connection");
+          auto& entries = indexes_.at(connection);
+          if (count > expected->second - entries.size()) throw FormatError("IDXDATA count exceeds CHUNK_INFO count");
           for (std::uint32_t entry_index = 0; entry_index < count; ++entry_index) {
             const auto sec = read_u32(input, "IDXDATA seconds");
             const auto nsec = read_u32(input, "IDXDATA nanoseconds");
+            if (nsec >= 1000000000U) throw FormatError("invalid IDXDATA nanoseconds");
             entries.push_back({static_cast<std::uint64_t>(sec) * 1000000000ULL + nsec,
                                static_cast<std::uint32_t>(chunk_index), read_u32(input, "IDXDATA offset")});
           }
         }
       }
+      for (const auto& item : expected_counts)
+        if (indexes_.at(item.first).size() != item.second) throw FormatError("IDXDATA count does not match CHUNK_INFO");
       for (auto& item : indexes_) std::stable_sort(item.second.begin(), item.second.end(), [](const IndexEntry& left, const IndexEntry& right) { return left.timestamp < right.timestamp; });
       for (auto& connection : connections_) connection.message_count = indexes_[connection.id].size();
       metadata_.storage = StorageKind::Rosbag1;
@@ -339,6 +383,7 @@ class Rosbag1Backend final : public Backend {
   void close() noexcept override {
     open_ = false;
     connections_.clear();
+    connection_positions_.clear();
     chunk_infos_.clear();
     chunks_.clear();
     indexes_.clear();
@@ -372,14 +417,15 @@ class Rosbag1Backend final : public Backend {
     throw UnsupportedFeature("unsupported ROS1 chunk compression: " + chunk.compression);
   }
   const Connection* find_connection(std::uint32_t id) const {
-    const auto it = std::find_if(connections_.begin(), connections_.end(), [id](const auto& value) { return value.id == id; });
-    return it == connections_.end() ? nullptr : &*it;
+    const auto it = connection_positions_.find(id);
+    return it == connection_positions_.end() ? nullptr : &connections_[it->second];
   }
   void ensure_open() const { if (!open_) throw RosbagsError("ROS1 reader is not open"); }
 
   std::string path_;
   ReaderOptions options_;
   std::vector<Connection> connections_;
+  std::unordered_map<std::uint32_t, std::size_t> connection_positions_;
   std::vector<ChunkInfo> chunk_infos_;
   std::vector<Chunk> chunks_;
   std::unordered_map<std::uint32_t, std::vector<IndexEntry>> indexes_;
@@ -402,7 +448,7 @@ class Rosbag1Backend::Cursor final : public BackendCursor {
       const auto& entries = found->second;
       const auto first = filter.start ? std::lower_bound(entries.begin(), entries.end(), *filter.start, [](const IndexEntry& entry, std::uint64_t time) { return entry.timestamp < time; }) : entries.begin();
       if (first != entries.end() && (!stop_ || first->timestamp < *stop_)) {
-        heap_.push({first->timestamp, rank, static_cast<std::size_t>(std::distance(entries.begin(), first)), &entries});
+        heap_.push({first->timestamp, rank, static_cast<std::size_t>(std::distance(entries.begin(), first)), &entries, connection.id});
       }
       ++rank;
     }
@@ -415,23 +461,32 @@ class Rosbag1Backend::Cursor final : public BackendCursor {
     heap_.pop();
     const auto& entry = (*item.entries)[item.position];
     if (!cached_chunk_index_ || *cached_chunk_index_ != entry.chunk_index) {
+      // A failed next() ends this cursor's usable scan; release the old chunk
+      // before allocating its replacement to avoid keeping both resident.
+      Bytes{}.swap(cached_chunk_);
+      cached_chunk_index_.reset();
       cached_chunk_ = owner_.load_chunk(input_, owner_.chunks_.at(entry.chunk_index));
       cached_chunk_index_ = entry.chunk_index;
     }
     ByteView chunk{cached_chunk_.data(), cached_chunk_.size()};
     std::size_t position = entry.offset;
-    Record record = read_record(chunk, position);
-    while (field_u8(record.header.fields, "op") == 7) record = read_record(chunk, position);
+    Record record = read_record(chunk, position, owner_.options_.max_rosbag1_header_bytes);
+    while (field_u8(record.header.fields, "op") == 7)
+      record = read_record(chunk, position, owner_.options_.max_rosbag1_header_bytes);
     if (field_u8(record.header.fields, "op") != 2) throw FormatError(context(owner_.path_, "index does not point to MSGDATA"));
-    const auto time = ros_time(record.header.fields.at("time"));
+    const auto time = field_time(record.header.fields, "time");
     if (time != entry.timestamp) throw FormatError(context(owner_.path_, "IDXDATA timestamp mismatch"));
-    const auto* connection = owner_.find_connection(field_u32(record.header.fields, "conn"));
+    const auto connection_id = field_u32(record.header.fields, "conn");
+    if (connection_id != item.connection_id) throw FormatError(context(owner_.path_, "IDXDATA connection mismatch"));
+    const auto* connection = owner_.find_connection(connection_id);
     if (!connection) throw FormatError(context(owner_.path_, "MSGDATA references unknown connection"));
+    if (record.body.size > owner_.options_.max_message_bytes)
+      throw ResourceLimitError("ROS1 message exceeds max_message_bytes");
     output = Message{std::make_shared<Bytes>(record.body.data, record.body.data + record.body.size), time, connection, owner_.path_};
     const auto next_position = item.position + 1;
     if (next_position < item.entries->size()) {
       const auto& next = (*item.entries)[next_position];
-      if (!stop_ || next.timestamp < *stop_) heap_.push({next.timestamp, item.rank, next_position, item.entries});
+      if (!stop_ || next.timestamp < *stop_) heap_.push({next.timestamp, item.rank, next_position, item.entries, item.connection_id});
     }
     return true;
   }
@@ -442,6 +497,7 @@ class Rosbag1Backend::Cursor final : public BackendCursor {
     std::size_t rank = 0;
     std::size_t position = 0;
     const std::vector<IndexEntry>* entries = nullptr;
+    std::uint32_t connection_id = 0;
   };
   struct HeapCompare {
     bool operator()(const HeapItem& left, const HeapItem& right) const {

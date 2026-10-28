@@ -1,7 +1,10 @@
 #include "internal.hpp"
+#include "temporary_file.hpp"
 
 #include <sqlite3.h>
+#define ZSTD_STATIC_LINKING_ONLY
 #include <zstd.h>
+#include <zstd_errors.h>
 
 #include <cstdio>
 #include <cctype>
@@ -43,45 +46,66 @@ std::uint64_t node_uint64(const YAML::Node& node, const char* key, std::uint64_t
   return value && !value.IsNull() ? value.as<std::uint64_t>() : fallback;
 }
 
-Bytes zstd_bytes(ByteView compressed) {
-  const auto size = ZSTD_getFrameContentSize(compressed.data, compressed.size);
-  if (size == ZSTD_CONTENTSIZE_ERROR)
-    throw FormatError("invalid zstd frame");
-  if (size == ZSTD_CONTENTSIZE_UNKNOWN) {
-    ZSTD_DStream* stream = ZSTD_createDStream();
-    if (!stream) throw RosbagsError("cannot create zstd decompressor");
-    const std::unique_ptr<ZSTD_DStream, decltype(&ZSTD_freeDStream)> stream_guard(
-        stream, &ZSTD_freeDStream);
-    if (ZSTD_isError(ZSTD_initDStream(stream)))
-      throw FormatError("zstd decompression initialization failed");
-    Bytes output;
-    std::array<Byte, 64 * 1024> buffer{};
-    ZSTD_inBuffer input{compressed.data, compressed.size, 0};
-    for (;;) {
-      const auto previous_input = input.pos;
-      ZSTD_outBuffer destination{buffer.data(), buffer.size(), 0};
-      const auto result = ZSTD_decompressStream(stream, &destination, &input);
-      if (ZSTD_isError(result)) throw FormatError("zstd decompression failed");
-      output.insert(output.end(), buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(destination.pos));
-      if (result == 0 && input.pos == input.size) break;
-      if (input.pos == previous_input && destination.pos == 0) {
-        if (input.pos == input.size) throw FormatError("truncated zstd frame");
-        throw FormatError("zstd decompressor made no progress");
-      }
+template <typename Read, typename Write>
+std::uint64_t stream_zstd(Read read, Write write, std::uint64_t limit, std::size_t window_limit) {
+  const std::unique_ptr<ZSTD_DStream, decltype(&ZSTD_freeDStream)> stream(ZSTD_createDStream(), &ZSTD_freeDStream);
+  if (!stream) throw RosbagsError("cannot create zstd decompressor");
+  if (ZSTD_isError(ZSTD_initDStream(stream.get())) ||
+      ZSTD_isError(ZSTD_DCtx_setMaxWindowSize(stream.get(), window_limit)))
+    throw RosbagsError("invalid zstd decompression window limit");
+  std::array<Byte,64*1024> source{}, destination{};
+  ZSTD_inBuffer input{source.data(),0,0};
+  bool eof=false, seen_input=false, complete=false;
+  std::uint64_t output_size=0;
+  for (;;) {
+    if (input.pos==input.size && !eof) {
+      input.size=read(source.data(),source.size()); input.pos=0;
+      eof=input.size==0; seen_input=seen_input || !eof;
     }
-    return output;
+    if (eof && input.pos==input.size && complete) return output_size;
+    if (!seen_input) throw FormatError("empty zstd input");
+    const auto previous=input.pos;
+    ZSTD_outBuffer output{destination.data(),destination.size(),0};
+    const auto result=ZSTD_decompressStream(stream.get(),&output,&input);
+    if (ZSTD_isError(result)) {
+      if (ZSTD_getErrorCode(result)==ZSTD_error_frameParameter_windowTooLarge)
+        throw ResourceLimitError("zstd frame exceeds max_zstd_window_bytes");
+      throw FormatError(std::string("zstd decompression failed: ")+ZSTD_getErrorName(result));
+    }
+    if (output.pos > limit-output_size) throw ResourceLimitError("zstd output exceeds decompression budget");
+    if (output.pos) write(ByteView{destination.data(),output.pos});
+    output_size+=output.pos;
+    complete=result==0;
+    if (input.pos==previous && output.pos==0) {
+      if (eof) throw FormatError("truncated zstd frame");
+      throw FormatError("zstd decompressor made no progress");
+    }
   }
-  if (size > std::numeric_limits<std::size_t>::max())
-    throw FormatError("cannot determine zstd frame size");
-  Bytes output(static_cast<std::size_t>(size));
-  const auto result = ZSTD_decompress(output.data(), output.size(), compressed.data, compressed.size);
-  if (ZSTD_isError(result) || result != output.size()) throw FormatError("zstd decompression failed");
+}
+
+Bytes zstd_bytes(ByteView compressed, const ReaderOptions& options) {
+  std::size_t offset=0;
+  Bytes output;
+  stream_zstd([&](Byte* buffer,std::size_t size) {
+    const auto count=std::min(size,compressed.size-offset);
+    if (count) std::memcpy(buffer,compressed.data+offset,count);
+    offset+=count; return count;
+  }, [&](ByteView bytes) {
+    const auto required=output.size()+bytes.size;
+    if (required > output.capacity()) {
+      const auto capacity=output.capacity();
+      const auto growth=capacity > options.max_message_bytes/2 ? options.max_message_bytes : capacity*2;
+      output.reserve(std::max(required,growth));
+    }
+    output.insert(output.end(),bytes.data,bytes.data+bytes.size);
+  },
+     options.max_message_bytes,options.max_zstd_window_bytes);
   return output;
 }
 
 class SqliteBackend final : public Backend {
  public:
-  explicit SqliteBackend(std::string path) : path_(std::move(path)) {}
+  SqliteBackend(std::string path, ReaderOptions options) : path_(std::move(path)), options_(options) {}
   void open() override {
     if (open_) throw RosbagsError("SQLite reader is already open");
     database_.reset();
@@ -92,6 +116,7 @@ class SqliteBackend final : public Backend {
     sqlite3* raw = nullptr;
     const auto result = sqlite3_open_v2(path_.c_str(), &raw, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nullptr);
     database_.value = raw;
+    try {
     if (result != SQLITE_OK) throw RosbagsError(sqlite_error(database_.value, "cannot open SQLite database"));
     sqlite3_busy_timeout(database_.value, 5000);
     if (!has_table("messages") || !has_table("topics")) throw FormatError(sqlite_error(database_.value, "database missing topics/messages tables"));
@@ -101,6 +126,7 @@ class SqliteBackend final : public Backend {
     metadata_.files = {path_};
     metadata_.storage = StorageKind::Sqlite3;
     open_ = true;
+    } catch (...) { close(); throw; }
   }
   void close() noexcept override {
     open_ = false;
@@ -117,56 +143,60 @@ class SqliteBackend final : public Backend {
  private:
   class Cursor;
   bool has_table(const char* name) const {
-    sqlite3_stmt* statement = nullptr;
+    SqliteStatement statement;
     const char* sql = "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?";
-    if (sqlite3_prepare_v2(database_.value, sql, -1, &statement, nullptr) != SQLITE_OK) throw RosbagsError(sqlite_error(database_.value, "cannot inspect SQLite schema"));
-    sqlite3_bind_text(statement, 1, name, -1, SQLITE_STATIC);
-    const auto result = sqlite3_step(statement);
-    const auto count = result == SQLITE_ROW ? sqlite3_column_int(statement, 0) : 0;
-    sqlite3_finalize(statement);
+    if (sqlite3_prepare_v2(database_.value, sql, -1, &statement.value, nullptr) != SQLITE_OK) throw RosbagsError(sqlite_error(database_.value, "cannot inspect SQLite schema"));
+    if (sqlite3_bind_text(statement.value, 1, name, -1, SQLITE_STATIC) != SQLITE_OK)
+      throw RosbagsError(sqlite_error(database_.value, "cannot bind schema query"));
+    const auto result = sqlite3_step(statement.value);
+    const auto count = result == SQLITE_ROW ? sqlite3_column_int(statement.value, 0) : 0;
+    statement.reset();
     if (result != SQLITE_ROW) throw RosbagsError(sqlite_error(database_.value, "cannot inspect SQLite schema"));
     return count == 1;
   }
   int detect_schema() const {
-    sqlite3_stmt* statement = nullptr;
-    if (sqlite3_prepare_v2(database_.value, "PRAGMA table_info(schema)", -1, &statement, nullptr) != SQLITE_OK) throw RosbagsError(sqlite_error(database_.value, "cannot inspect schema table"));
+    SqliteStatement statement;
+    if (sqlite3_prepare_v2(database_.value, "PRAGMA table_info(schema)", -1, &statement.value, nullptr) != SQLITE_OK) throw RosbagsError(sqlite_error(database_.value, "cannot inspect schema table"));
     bool has_schema_table = false;
-    while (sqlite3_step(statement) == SQLITE_ROW) has_schema_table = true;
-    sqlite3_finalize(statement);
+    int step = SQLITE_OK;
+    while ((step = sqlite3_step(statement.value)) == SQLITE_ROW) has_schema_table = true;
+    if (step != SQLITE_DONE) throw RosbagsError(sqlite_error(database_.value, "cannot inspect schema table"));
+    statement.reset();
     if (has_schema_table) {
-      if (sqlite3_prepare_v2(database_.value, "SELECT schema_version FROM schema LIMIT 1", -1, &statement, nullptr) != SQLITE_OK) throw RosbagsError(sqlite_error(database_.value, "cannot read schema version"));
-      const auto result = sqlite3_step(statement);
-      const auto version = result == SQLITE_ROW ? sqlite3_column_int(statement, 0) : -1;
-      sqlite3_finalize(statement);
+      if (sqlite3_prepare_v2(database_.value, "SELECT schema_version FROM schema LIMIT 1", -1, &statement.value, nullptr) != SQLITE_OK) throw RosbagsError(sqlite_error(database_.value, "cannot read schema version"));
+      const auto result = sqlite3_step(statement.value);
+      const auto version = result == SQLITE_ROW ? sqlite3_column_int(statement.value, 0) : -1;
+      statement.reset();
       if (result != SQLITE_ROW || version < 1) throw FormatError("invalid SQLite schema version");
       return version;
     }
-    if (sqlite3_prepare_v2(database_.value, "PRAGMA table_info(topics)", -1, &statement, nullptr) != SQLITE_OK) throw RosbagsError(sqlite_error(database_.value, "cannot inspect topics table"));
+    if (sqlite3_prepare_v2(database_.value, "PRAGMA table_info(topics)", -1, &statement.value, nullptr) != SQLITE_OK) throw RosbagsError(sqlite_error(database_.value, "cannot inspect topics table"));
     bool qos = false;
-    while (sqlite3_step(statement) == SQLITE_ROW) {
-      const auto* name = reinterpret_cast<const char*>(sqlite3_column_text(statement, 1));
+    while ((step = sqlite3_step(statement.value)) == SQLITE_ROW) {
+      const auto* name = reinterpret_cast<const char*>(sqlite3_column_text(statement.value, 1));
       if (name && std::string_view(name) == "offered_qos_profiles") qos = true;
     }
-    sqlite3_finalize(statement);
+    if (step != SQLITE_DONE) throw RosbagsError(sqlite_error(database_.value, "cannot inspect topics table"));
     return qos ? 2 : 1;
   }
   std::unordered_map<std::string, MessageDefinition> definitions() const {
     std::unordered_map<std::string, MessageDefinition> result;
     if (schema_ < 4 || !has_table("message_definitions")) return result;
-    sqlite3_stmt* statement = nullptr;
+    SqliteStatement statement;
     const auto sql = "SELECT topic_type,encoding,encoded_message_definition,type_description_hash FROM message_definitions ORDER BY id";
-    if (sqlite3_prepare_v2(database_.value, sql, -1, &statement, nullptr) != SQLITE_OK) throw RosbagsError(sqlite_error(database_.value, "cannot read message definitions"));
-    while (sqlite3_step(statement) == SQLITE_ROW) {
-      const auto* type = reinterpret_cast<const char*>(sqlite3_column_text(statement, 0));
-      const auto* encoding = reinterpret_cast<const char*>(sqlite3_column_text(statement, 1));
-      const auto* data = reinterpret_cast<const char*>(sqlite3_column_text(statement, 2));
+    if (sqlite3_prepare_v2(database_.value, sql, -1, &statement.value, nullptr) != SQLITE_OK) throw RosbagsError(sqlite_error(database_.value, "cannot read message definitions"));
+    int step = SQLITE_OK;
+    while ((step = sqlite3_step(statement.value)) == SQLITE_ROW) {
+      const auto* type = reinterpret_cast<const char*>(sqlite3_column_text(statement.value, 0));
+      const auto* encoding = reinterpret_cast<const char*>(sqlite3_column_text(statement.value, 1));
+      const auto* data = reinterpret_cast<const char*>(sqlite3_column_text(statement.value, 2));
       if (!type || !encoding || !data) continue;
       const auto format = std::string_view(encoding) == "ros2msg" ? DefinitionFormat::Msg :
                           (std::string_view(encoding) == "ros2idl" ? DefinitionFormat::Idl : DefinitionFormat::None);
       result[normalize_type(type)] = {format, data};
-      definition_digests_[normalize_type(type)] = reinterpret_cast<const char*>(sqlite3_column_text(statement, 3)) ? reinterpret_cast<const char*>(sqlite3_column_text(statement, 3)) : "";
+      definition_digests_[normalize_type(type)] = reinterpret_cast<const char*>(sqlite3_column_text(statement.value, 3)) ? reinterpret_cast<const char*>(sqlite3_column_text(statement.value, 3)) : "";
     }
-    sqlite3_finalize(statement);
+    if (step != SQLITE_DONE) throw RosbagsError(sqlite_error(database_.value, "cannot read message definitions"));
     return result;
   }
   void load_connections() {
@@ -175,60 +205,65 @@ class SqliteBackend final : public Backend {
     const char* sql_v2 = "SELECT topics.id,name,type,count(messages.id),serialization_format,offered_qos_profiles FROM topics LEFT JOIN messages ON topics.id=messages.topic_id GROUP BY topics.id ORDER BY topics.id";
     const char* sql_v4 = "SELECT topics.id,name,type,count(messages.id),serialization_format,offered_qos_profiles,type_description_hash FROM topics LEFT JOIN messages ON topics.id=messages.topic_id GROUP BY topics.id ORDER BY topics.id";
     const char* sql = schema_ >= 4 ? sql_v4 : (schema_ >= 2 ? sql_v2 : sql_v1);
-    sqlite3_stmt* statement = nullptr;
-    if (sqlite3_prepare_v2(database_.value, sql, -1, &statement, nullptr) != SQLITE_OK) throw RosbagsError(sqlite_error(database_.value, "cannot read SQLite topics"));
-    while (sqlite3_step(statement) == SQLITE_ROW) {
+    SqliteStatement statement;
+    if (sqlite3_prepare_v2(database_.value, sql, -1, &statement.value, nullptr) != SQLITE_OK) throw RosbagsError(sqlite_error(database_.value, "cannot read SQLite topics"));
+    int step = SQLITE_OK;
+    while ((step = sqlite3_step(statement.value)) == SQLITE_ROW) {
       Connection connection;
-      connection.id = static_cast<std::uint32_t>(sqlite3_column_int64(statement, 0));
-      const auto* topic = reinterpret_cast<const char*>(sqlite3_column_text(statement, 1));
-      const auto* type = reinterpret_cast<const char*>(sqlite3_column_text(statement, 2));
-      const auto* format = reinterpret_cast<const char*>(sqlite3_column_text(statement, 4));
+      const auto id = sqlite3_column_int64(statement.value, 0);
+      if (id < 0 || static_cast<std::uint64_t>(id) > std::numeric_limits<std::uint32_t>::max())
+        throw FormatError("SQLite topic id exceeds uint32_t");
+      connection.id = static_cast<std::uint32_t>(id);
+      const auto* topic = reinterpret_cast<const char*>(sqlite3_column_text(statement.value, 1));
+      const auto* type = reinterpret_cast<const char*>(sqlite3_column_text(statement.value, 2));
+      const auto* format = reinterpret_cast<const char*>(sqlite3_column_text(statement.value, 4));
       connection.topic = topic ? normalize_topic(topic) : "";
       connection.original_topic = topic ? topic : "";
       connection.type = type ? normalize_type(type) : "";
-      connection.message_count = static_cast<std::uint64_t>(sqlite3_column_int64(statement, 3));
+      connection.message_count = static_cast<std::uint64_t>(sqlite3_column_int64(statement.value, 3));
       connection.serialization_format = format ? format : "";
       const auto definition = defs.find(connection.type);
       if (definition != defs.end()) connection.definition = definition->second;
       if (schema_ >= 4) {
-        const auto* digest = reinterpret_cast<const char*>(sqlite3_column_text(statement, 6));
+        const auto* digest = reinterpret_cast<const char*>(sqlite3_column_text(statement.value, 6));
         connection.digest = digest ? digest : "";
       }
       if (schema_ >= 2) {
-        const auto* qos = reinterpret_cast<const char*>(sqlite3_column_text(statement, 5));
+        const auto* qos = reinterpret_cast<const char*>(sqlite3_column_text(statement.value, 5));
         if (qos && *qos) connection.qos_profiles.push_back({qos});
       }
-      topic_to_connection_[connection.id] = connections_.size();
+      if (!topic_to_connection_.emplace(connection.id, connections_.size()).second)
+        throw FormatError("duplicate SQLite topic id");
       connections_.push_back(std::move(connection));
     }
-    sqlite3_finalize(statement);
+    if (step != SQLITE_DONE) throw RosbagsError(sqlite_error(database_.value, "cannot read SQLite topics"));
   }
   void load_metadata() {
-    sqlite3_stmt* statement = nullptr;
-    if (sqlite3_prepare_v2(database_.value, "SELECT MIN(timestamp),MAX(timestamp),COUNT(*) FROM messages", -1, &statement, nullptr) != SQLITE_OK) throw RosbagsError(sqlite_error(database_.value, "cannot read SQLite message metadata"));
-    const auto result = sqlite3_step(statement);
+    SqliteStatement statement;
+    if (sqlite3_prepare_v2(database_.value, "SELECT MIN(timestamp),MAX(timestamp),COUNT(*) FROM messages", -1, &statement.value, nullptr) != SQLITE_OK) throw RosbagsError(sqlite_error(database_.value, "cannot read SQLite message metadata"));
+    const auto result = sqlite3_step(statement.value);
     if (result != SQLITE_ROW) {
-      sqlite3_finalize(statement);
+      statement.reset();
       throw RosbagsError(sqlite_error(database_.value, "cannot read SQLite message metadata"));
     }
-    const auto count = sqlite3_column_int64(statement, 2);
+    const auto count = sqlite3_column_int64(statement.value, 2);
     metadata_.message_count = count < 0 ? 0 : static_cast<std::uint64_t>(count);
     if (metadata_.message_count) {
-      const auto start = sqlite3_column_int64(statement, 0);
-      const auto end = sqlite3_column_int64(statement, 1);
+      const auto start = sqlite3_column_int64(statement.value, 0);
+      const auto end = sqlite3_column_int64(statement.value, 1);
       if (start < 0 || end < 0) {
-        sqlite3_finalize(statement);
+        statement.reset();
         throw FormatError("negative SQLite timestamp cannot be represented by uint64_t");
       }
       metadata_.start_time = static_cast<std::uint64_t>(start);
       if (static_cast<std::uint64_t>(end) == std::numeric_limits<std::uint64_t>::max()) {
-        sqlite3_finalize(statement);
+        statement.reset();
         throw FormatError("SQLite timestamp overflows metadata end time");
       }
       metadata_.end_time = static_cast<std::uint64_t>(end) + 1;
       metadata_.duration = metadata_.end_time - metadata_.start_time;
     }
-    sqlite3_finalize(statement);
+    statement.reset();
   }
   const Connection* find_connection(std::uint32_t id) const {
     const auto it = topic_to_connection_.find(id);
@@ -237,6 +272,7 @@ class SqliteBackend final : public Backend {
   void ensure_open() const { if (!open_) throw RosbagsError("SQLite reader is not open"); }
 
   std::string path_;
+  ReaderOptions options_;
   mutable SqliteHandle database_;
   std::vector<Connection> connections_;
   std::unordered_map<std::uint32_t, std::size_t> topic_to_connection_;
@@ -250,25 +286,34 @@ class SqliteBackend::Cursor final : public BackendCursor {
  public:
   Cursor(const SqliteBackend& owner, const ReadFilter& filter) : owner_(owner) {
     owner_.ensure_open();
+    constexpr auto max_time = static_cast<std::uint64_t>(std::numeric_limits<sqlite3_int64>::max());
+    if ((filter.start && *filter.start > max_time) ||
+        (filter.start && filter.stop && *filter.start >= *filter.stop)) return;
+    const bool bind_stop = filter.stop && *filter.stop <= max_time;
+    const bool filter_topics = !filter.topics.empty() || !filter.connection_ids.empty();
     std::string sql = "SELECT topics.id,messages.timestamp,messages.data FROM messages JOIN topics ON messages.topic_id=topics.id";
     std::vector<std::uint32_t> topic_ids;
-    for (const auto& connection : owner_.connections_)
-      if (has_topic(connection, filter)) topic_ids.push_back(connection.id);
-    if (!filter.topics.empty() || !filter.connection_ids.empty()) {
+    if (filter_topics) {
+      for (const auto& connection : owner_.connections_)
+        if (has_topic(connection, filter)) topic_ids.push_back(connection.id);
       if (topic_ids.empty()) return;
       sql += " WHERE topics.id IN (";
       for (std::size_t index = 0; index < topic_ids.size(); ++index) sql += index ? ",?" : "?";
       sql += ")";
     }
     if (filter.start) sql += (sql.find(" WHERE ") == std::string::npos ? " WHERE" : " AND") + std::string(" messages.timestamp >= ?");
-    if (filter.stop) sql += (sql.find(" WHERE ") == std::string::npos ? " WHERE" : " AND") + std::string(" messages.timestamp < ?");
+    if (bind_stop) sql += (sql.find(" WHERE ") == std::string::npos ? " WHERE" : " AND") + std::string(" messages.timestamp < ?");
     sql += " ORDER BY messages.timestamp,messages.id";
     if (sqlite3_prepare_v2(owner_.database_.value, sql.c_str(), -1, &statement_.value, nullptr) != SQLITE_OK)
       throw RosbagsError(sqlite_error(owner_.database_.value, "cannot prepare SQLite message query"));
     int parameter = 1;
-    for (const auto id : topic_ids) sqlite3_bind_int64(statement_.value, parameter++, static_cast<sqlite3_int64>(id));
-    if (filter.start) sqlite3_bind_int64(statement_.value, parameter++, static_cast<sqlite3_int64>(*filter.start));
-    if (filter.stop) sqlite3_bind_int64(statement_.value, parameter++, static_cast<sqlite3_int64>(*filter.stop));
+    const auto bind = [&](std::uint64_t value) {
+      if (sqlite3_bind_int64(statement_.value, parameter++, static_cast<sqlite3_int64>(value)) != SQLITE_OK)
+        throw RosbagsError(sqlite_error(owner_.database_.value, "cannot bind SQLite message query"));
+    };
+    for (const auto id : topic_ids) bind(id);
+    if (filter.start) bind(*filter.start);
+    if (bind_stop) bind(*filter.stop);
   }
 
   bool next(Message& output) override {
@@ -288,6 +333,8 @@ class SqliteBackend::Cursor final : public BackendCursor {
     const auto* data = static_cast<const Byte*>(sqlite3_column_blob(statement_.value, 2));
     const auto size = sqlite3_column_bytes(statement_.value, 2);
     if (size < 0 || (size != 0 && !data)) throw FormatError("invalid SQLite message blob");
+    if (static_cast<std::size_t>(size) > owner_.options_.max_message_bytes)
+      throw ResourceLimitError("SQLite message exceeds max_message_bytes");
     auto bytes = std::make_shared<Bytes>();
     if (size) bytes->assign(data, data + size);
     output = Message{std::move(bytes), static_cast<std::uint64_t>(timestamp), connection, owner_.path_};
@@ -305,7 +352,7 @@ std::unique_ptr<BackendCursor> SqliteBackend::make_cursor(const ReadFilter& filt
 
 class DirectoryBackend final : public Backend {
  public:
-  explicit DirectoryBackend(std::string path) : path_(std::move(path)) {}
+  DirectoryBackend(std::string path, ReaderOptions options) : path_(std::move(path)), options_(options) {}
   ~DirectoryBackend() override { close_impl(); }
   void open() override {
     if (open_) throw RosbagsError("ROS2 directory reader is already open");
@@ -397,7 +444,7 @@ class DirectoryBackend final : public Backend {
         std::unique_ptr<Backend> backend;
         try {
           if (compression_mode_ == "file") actual = decompress_file(input);
-          backend = storage == "sqlite3" ? make_sqlite_backend(actual) : make_mcap_backend(actual);
+          backend = storage == "sqlite3" ? make_sqlite_backend(actual, options_) : make_mcap_backend(actual, options_);
           backend->open();
         } catch (RosbagsError& error) {
           ErrorContext context;
@@ -408,16 +455,28 @@ class DirectoryBackend final : public Backend {
         backends_.push_back(std::move(backend));
         metadata_.files.push_back(actual);
       }
-      for (auto& connection : connections_) {
-        for (const auto& backend : backends_) {
-          const auto it =
-              std::find_if(backend->connections().begin(), backend->connections().end(), [&](const auto& candidate) {
-                return candidate.topic == connection.topic && candidate.type == connection.type;
-              });
-          if (it != backend->connections().end() && it->definition.format != DefinitionFormat::None) {
-            connection.definition = it->definition;
-            break;
+      for (const auto& backend : backends_) {
+        for (const auto& child : backend->connections()) {
+          const auto it = std::find_if(connections_.begin(), connections_.end(), [&](const auto& candidate) {
+            return candidate.topic == child.topic && candidate.type == child.type;
+          });
+          if (it == connections_.end() || it->serialization_format != child.serialization_format ||
+              (!it->digest.empty() && !child.digest.empty() && it->digest != child.digest) ||
+              (it->definition.format != DefinitionFormat::None &&
+               it->definition.format == child.definition.format && it->definition.data != child.definition.data)) {
+            FormatError error("ROS2 directory metadata conflicts with storage connection");
+            ErrorContext details;
+            details.source_path = backend->metadata().files.front();
+            details.connection_id = child.id;
+            details.topic = child.original_topic;
+            details.type = child.type;
+            details.serialization_format = child.serialization_format;
+            error.add_context(details);
+            throw error;
           }
+          if (it->digest.empty()) it->digest = child.digest;
+          if (it->definition.format == DefinitionFormat::None) it->definition = child.definition;
+          connection_map_.emplace(&child, static_cast<std::size_t>(it - connections_.begin()));
         }
       }
       open_ = true;
@@ -438,55 +497,37 @@ class DirectoryBackend final : public Backend {
   void close_impl() noexcept {
     for (auto it = backends_.rbegin(); it != backends_.rend(); ++it) (*it)->close();
     backends_.clear();
-    for (const auto& file : temporary_files_) std::remove(file.c_str());
+    connection_map_.clear();
     temporary_files_.clear();
+    temporary_bytes_=0;
     open_ = false;
   }
   std::string decompress_file(const std::filesystem::path& input) {
-    const auto compressed = read_file(input);
-    const auto bytes = zstd_bytes(ByteView{compressed.data(), compressed.size()});
-    auto pattern = (std::filesystem::temp_directory_path() / "rosbags_cpp_XXXXXX").string();
-    std::vector<char> buffer(pattern.begin(), pattern.end());
-    buffer.push_back('\0');
-    int descriptor = ::mkstemp(buffer.data());
-    if (descriptor < 0)
-      throw RosbagsError(context(pattern, std::string("cannot create temporary file: ") + std::strerror(errno)));
-    const std::string output(buffer.data());
-    try {
-      std::size_t offset = 0;
-      while (offset < bytes.size()) {
-        const auto remaining = std::min(
-            bytes.size() - offset,
-            static_cast<std::size_t>(std::numeric_limits<ssize_t>::max()));
-        const auto count = ::write(descriptor, bytes.data() + offset, remaining);
-        if (count < 0 && errno == EINTR) continue;
-        if (count < 0)
-          throw RosbagsError(context(output, std::string("cannot write decompressed storage file: ") +
-                                               std::strerror(errno)));
-        if (count == 0)
-          throw RosbagsError(context(output, "cannot write decompressed storage file: wrote zero bytes"));
-        offset += static_cast<std::size_t>(count);
-      }
-      if (::close(descriptor) != 0) {
-        descriptor = -1;
-        throw RosbagsError(context(output, std::string("cannot close decompressed storage file: ") +
-                                             std::strerror(errno)));
-      }
-      descriptor = -1;
-      temporary_files_.push_back(output);
-      return output;
-    } catch (...) {
-      if (descriptor >= 0) ::close(descriptor);
-      std::remove(output.c_str());
-      throw;
-    }
+    std::ifstream compressed(input,std::ios::binary);
+    if (!compressed) throw RosbagsError(context(input.string(),"cannot open compressed storage"));
+    auto temporary=std::make_unique<TemporaryFile>("rosbags_cpp");
+    const auto limit=std::min(options_.max_decompressed_file_bytes, options_.max_temporary_bytes-temporary_bytes_);
+    const auto size=stream_zstd([&](Byte* buffer,std::size_t count) {
+      compressed.read(reinterpret_cast<char*>(buffer),static_cast<std::streamsize>(count));
+      if (compressed.bad() || (compressed.fail() && !compressed.eof()))
+        throw RosbagsError("cannot read compressed storage");
+      return static_cast<std::size_t>(compressed.gcount());
+    }, [&](ByteView bytes) { temporary->write(bytes); },limit,options_.max_zstd_window_bytes);
+    temporary->close();
+    const auto output=temporary->path();
+    temporary_files_.push_back(std::move(temporary));
+    temporary_bytes_+=size;
+    return output;
   }
   void ensure_open() const { if (!open_) throw RosbagsError("ROS2 directory reader is not open"); }
 
   std::string path_;
+  ReaderOptions options_;
   std::vector<std::unique_ptr<Backend>> backends_;
   std::vector<Connection> connections_;
-  mutable std::vector<std::string> temporary_files_;
+  std::unordered_map<const Connection*, std::size_t> connection_map_;
+  std::vector<std::unique_ptr<TemporaryFile>> temporary_files_;
+  std::uint64_t temporary_bytes_=0;
   ReaderMetadata metadata_;
   std::string compression_format_;
   std::string compression_mode_;
@@ -520,7 +561,7 @@ class DirectoryBackend::Cursor final : public BackendCursor {
     const auto* connection = map_connection(message.connection);
     if (!connection) throw FormatError("message references unknown ROS2 directory topic");
     if (owner_.compression_mode_ == "message") {
-      message.bytes = std::make_shared<Bytes>(zstd_bytes(ByteView{message.bytes->data(), message.bytes->size()}));
+      message.bytes = std::make_shared<Bytes>(zstd_bytes(ByteView{message.bytes->data(), message.bytes->size()}, owner_.options_));
     }
     message.connection = connection;
     output = std::move(message);
@@ -545,11 +586,8 @@ class DirectoryBackend::Cursor final : public BackendCursor {
   };
 
   const Connection* map_connection(const Connection* child) const {
-    if (!child) return nullptr;
-    const auto it = std::find_if(owner_.connections_.begin(), owner_.connections_.end(), [&](const auto& connection) {
-      return connection.topic == child->topic && connection.type == child->type;
-    });
-    return it == owner_.connections_.end() ? nullptr : &*it;
+    const auto it = owner_.connection_map_.find(child);
+    return it == owner_.connection_map_.end() ? nullptr : &owner_.connections_[it->second];
   }
 
   void pull(std::size_t source_index) {
@@ -558,7 +596,8 @@ class DirectoryBackend::Cursor final : public BackendCursor {
     try {
       while (source.cursor->next(message)) {
         const auto* connection = map_connection(message.connection);
-        if (!connection || !has_topic(*connection, filter_) || !in_time(message.timestamp, filter_)) continue;
+        if (!connection) throw FormatError("message references unknown ROS2 directory connection");
+        if (!has_topic(*connection, filter_) || !in_time(message.timestamp, filter_)) continue;
         source.head = std::move(message);
         heap_.push({source.head->timestamp, source_index});
         return;
@@ -584,7 +623,7 @@ std::unique_ptr<BackendCursor> DirectoryBackend::make_cursor(const ReadFilter& f
 
 }  // namespace
 
-std::unique_ptr<Backend> make_sqlite_backend(const std::string& path) { return std::make_unique<SqliteBackend>(path); }
-std::unique_ptr<Backend> make_directory_backend(const std::string& path) { return std::make_unique<DirectoryBackend>(path); }
+std::unique_ptr<Backend> make_sqlite_backend(const std::string& path, ReaderOptions options) { return std::make_unique<SqliteBackend>(path, options); }
+std::unique_ptr<Backend> make_directory_backend(const std::string& path, ReaderOptions options) { return std::make_unique<DirectoryBackend>(path, options); }
 
 }  // namespace rosbags::internal

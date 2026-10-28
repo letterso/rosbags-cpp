@@ -23,6 +23,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(SQLite3 REQUIRED)
 find_package(yaml-cpp REQUIRED)
+if(TARGET yaml-cpp::yaml-cpp)
+  set(ROSBAGS_YAML_TARGET yaml-cpp::yaml-cpp)
+else()
+  set(ROSBAGS_YAML_TARGET yaml-cpp)
+endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LZ4 REQUIRED IMPORTED_TARGET liblz4)
 pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
@@ -112,7 +117,7 @@ target_include_directories(rosbags_cpp
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 target_link_libraries(rosbags_cpp
-  PUBLIC SQLite::SQLite3 yaml-cpp PkgConfig::LZ4 PkgConfig::ZSTD
+  PUBLIC SQLite::SQLite3 ${ROSBAGS_YAML_TARGET} PkgConfig::LZ4 PkgConfig::ZSTD
 )
 if(ROSBAGS_HAS_BZ2)
   target_link_libraries(rosbags_cpp PUBLIC BZip2::BZip2)
@@ -188,6 +193,8 @@ if(ROSBAGS_BUILD_TESTS)
       "-DEXE_SUFFIX=${CMAKE_EXECUTABLE_SUFFIX}"
       "-DSDK_PREFIX=${ROSBAGS_MCAP_ROOT}"
       "-DSDK_CONFIG_DIR=${mcap_DIR}"
+      "-DCONSUMER_CXX_FLAGS=${CMAKE_CXX_FLAGS}"
+      "-DCONSUMER_EXE_LINKER_FLAGS=${CMAKE_EXE_LINKER_FLAGS}"
       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/install_test.cmake)
   set_tests_properties(rosbags_cpp_install_test PROPERTIES TIMEOUT 120)
   # doctest v2.5.3 is vendored as its official single header.  No doctest
@@ -223,10 +230,18 @@ if(ROSBAGS_BUILD_TESTS)
       COMMAND $<TARGET_FILE:rosbags-gen>
         --profile ros2_humble
         --input "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/dependencies"
+        --input "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/review"
         --output "${ROSBAGS_CODEGEN_TEST_DIR}"
       DEPENDS rosbags-gen
         tests/data/dependencies/msg/AEnvelope.msg
         tests/data/dependencies/msg/ZPayload.msg
+        tests/data/review/msg/Bounded.msg
+        tests/data/review/msg/Clock.msg
+        tests/data/review/msg/Empty.msg
+        tests/data/review/msg/Envelope.msg
+        tests/data/review/msg/Payload.msg
+        tests/data/review/msg/Node.msg
+        tests/data/review/msg/Basic.idl
       VERBATIM
     )
     rosbags_add_test(rosbags_codegen_compile_test rosbags_cpp_codegen_compile_test

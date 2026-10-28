@@ -117,6 +117,21 @@ struct ReaderOptions {
   // ROS1 compresses whole chunks.  The reader must materialize one such chunk
   // before it can seek to an indexed message offset.
   std::size_t max_rosbag1_chunk_bytes = 256U * 1024U * 1024U;
+  std::size_t max_mcap_chunk_bytes = 256U * 1024U * 1024U;
+  std::size_t max_rosbag1_header_bytes = 1024U * 1024U;
+  std::size_t max_connection_body_bytes = 16U * 1024U * 1024U;
+  std::size_t max_index_bytes = 256U * 1024U * 1024U;
+  std::size_t max_message_bytes = 256U * 1024U * 1024U;
+  std::uint64_t max_decompressed_file_bytes = 128ULL * 1024ULL * 1024ULL * 1024ULL;
+  std::uint64_t max_temporary_bytes = 256ULL * 1024ULL * 1024ULL * 1024ULL;
+  std::size_t max_zstd_window_bytes = 128U * 1024U * 1024U;
+};
+
+struct DecodeLimits {
+  std::size_t max_sequence_elements = 16U * 1024U * 1024U;
+  // Requested object and dynamic storage; allocator bookkeeping is not included.
+  std::size_t max_decoded_bytes = 256U * 1024U * 1024U;
+  std::size_t max_nesting_depth = 64;
 };
 
 class Reader;
@@ -168,7 +183,7 @@ class Reader {
   void read_raw(const ReadFilter& filter, const MessageCallback& callback) const;
   void read_decoded(const ReadFilter& filter, const TypeRegistry& registry, std::string_view profile,
                     const DecodedCallback& callback, UnknownTypePolicy policy = UnknownTypePolicy::WarnAndSkip,
-                    const WarningCallback& warning = {}) const;
+                    const WarningCallback& warning = {}, DecodeLimits limits = {}) const;
 
  private:
   struct Impl;
@@ -193,7 +208,7 @@ class AnyReader {
   void read_raw(const ReadFilter& filter, const MessageCallback& callback) const;
   void read_decoded(const ReadFilter& filter, const TypeRegistry& registry, std::string_view profile,
                     const DecodedCallback& callback, UnknownTypePolicy policy = UnknownTypePolicy::WarnAndSkip,
-                    const WarningCallback& warning = {}) const;
+                    const WarningCallback& warning = {}, DecodeLimits limits = {}) const;
 
  private:
   struct Impl;
@@ -208,6 +223,13 @@ struct TypeSupportBase {
   virtual ~TypeSupportBase() = default;
   virtual std::shared_ptr<void> deserialize_ros1(ByteView data) const = 0;
   virtual std::shared_ptr<void> deserialize_cdr(ByteView data) const = 0;
+  // Legacy custom supports remain usable; limit-aware supports override these.
+  virtual std::shared_ptr<void> deserialize_ros1(ByteView data, const DecodeLimits&) const {
+    return deserialize_ros1(data);
+  }
+  virtual std::shared_ptr<void> deserialize_cdr(ByteView data, const DecodeLimits&) const {
+    return deserialize_cdr(data);
+  }
   virtual std::string to_text(const void* object) const = 0;
 };
 
@@ -215,8 +237,11 @@ template <typename T>
 struct TypeSupport final : TypeSupportBase {
   using Ros1Decoder = std::function<T(ByteView)>;
   using CdrDecoder = std::function<T(ByteView)>;
+  using LimitedDecoder = std::function<T(ByteView, const DecodeLimits&)>;
   Ros1Decoder ros1_decoder;
   CdrDecoder cdr_decoder;
+  LimitedDecoder limited_ros1_decoder;
+  LimitedDecoder limited_cdr_decoder;
   std::function<std::string(const T&)> formatter;
 
   TypeSupport(std::string name, std::string profile_name, Ros1Decoder ros1, CdrDecoder cdr,
@@ -226,11 +251,27 @@ struct TypeSupport final : TypeSupportBase {
     profile = std::move(profile_name);
     cpp_type = typeid(T);
   }
+  TypeSupport(std::string name, std::string profile_name, LimitedDecoder ros1, LimitedDecoder cdr,
+              std::function<std::string(const T&)> format = {})
+      : TypeSupport(std::move(name), std::move(profile_name),
+          Ros1Decoder{[ros1](ByteView data) { return ros1(data, DecodeLimits{}); }},
+          CdrDecoder{[cdr](ByteView data) { return cdr(data, DecodeLimits{}); }}, std::move(format)) {
+    limited_ros1_decoder = std::move(ros1);
+    limited_cdr_decoder = std::move(cdr);
+  }
   std::shared_ptr<void> deserialize_ros1(ByteView data) const override {
     return std::make_shared<T>(ros1_decoder(data));
   }
   std::shared_ptr<void> deserialize_cdr(ByteView data) const override {
     return std::make_shared<T>(cdr_decoder(data));
+  }
+  std::shared_ptr<void> deserialize_ros1(ByteView data, const DecodeLimits& limits) const override {
+    return limited_ros1_decoder ? std::make_shared<T>(limited_ros1_decoder(data, limits))
+                               : deserialize_ros1(data);
+  }
+  std::shared_ptr<void> deserialize_cdr(ByteView data, const DecodeLimits& limits) const override {
+    return limited_cdr_decoder ? std::make_shared<T>(limited_cdr_decoder(data, limits))
+                              : deserialize_cdr(data);
   }
   std::string to_text(const void* object) const override {
     if (formatter) return formatter(*static_cast<const T*>(object));
@@ -272,7 +313,7 @@ struct DecodedMessage {
 
 std::optional<DecodedMessage> decode(const Message& message, const TypeRegistry& registry,
                                      std::string_view profile, UnknownTypePolicy policy,
-                                     const WarningCallback& warning = {});
+                                     const WarningCallback& warning = {}, DecodeLimits limits = {});
 
 std::string storage_kind_name(StorageKind kind);
 std::string definition_format_name(DefinitionFormat format);

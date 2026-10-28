@@ -172,14 +172,14 @@ Reader::Reader(std::string path, ReaderOptions options) : impl_(std::make_shared
   const std::filesystem::path input(impl_->path);
   if (!std::filesystem::exists(input)) throw RosbagsError("path does not exist: " + impl_->path);
   if (std::filesystem::is_directory(input)) {
-    impl_->backend = internal::make_directory_backend(impl_->path);
+    impl_->backend = internal::make_directory_backend(impl_->path, options);
   } else if (input.extension() == ".bag") {
     impl_->backend = internal::make_rosbag1_backend(impl_->path, options);
   } else if (input.extension() == ".mcap") {
-    impl_->backend = internal::make_mcap_backend(impl_->path);
+    impl_->backend = internal::make_mcap_backend(impl_->path, options);
   } else {
     // ROS2 files are SQLite databases even when an application uses a custom suffix.
-    impl_->backend = internal::make_sqlite_backend(impl_->path);
+    impl_->backend = internal::make_sqlite_backend(impl_->path, options);
   }
 }
 
@@ -235,10 +235,10 @@ void Reader::read_raw(const ReadFilter& filter, const MessageCallback& callback)
 }
 void Reader::read_decoded(const ReadFilter& filter, const TypeRegistry& registry, std::string_view profile,
                           const DecodedCallback& callback, UnknownTypePolicy policy,
-                          const WarningCallback& warning) const {
+                          const WarningCallback& warning, DecodeLimits limits) const {
   if (!callback) throw RosbagsError("decoded message callback is empty");
   read_raw(filter, [&](const Message& message) {
-    if (const auto value = decode(message, registry, profile, policy, warning)) callback(message, *value);
+    if (const auto value = decode(message, registry, profile, policy, warning, limits)) callback(message, *value);
   });
 }
 
@@ -325,10 +325,10 @@ void AnyReader::read_raw(const ReadFilter& filter, const MessageCallback& callba
 }
 void AnyReader::read_decoded(const ReadFilter& filter, const TypeRegistry& registry, std::string_view profile,
                              const DecodedCallback& callback, UnknownTypePolicy policy,
-                             const WarningCallback& warning) const {
+                             const WarningCallback& warning, DecodeLimits limits) const {
   if (!callback) throw RosbagsError("decoded message callback is empty");
   read_raw(filter, [&](const Message& message) {
-    if (const auto value = decode(message, registry, profile, policy, warning)) callback(message, *value);
+    if (const auto value = decode(message, registry, profile, policy, warning, limits)) callback(message, *value);
   });
 }
 
@@ -357,7 +357,7 @@ std::vector<std::string> TypeRegistry::types() const {
 
 std::optional<DecodedMessage> decode(const Message& message, const TypeRegistry& registry,
                                      std::string_view profile, UnknownTypePolicy policy,
-                                     const WarningCallback& warning) {
+                                     const WarningCallback& warning, DecodeLimits limits) {
   const auto message_context = [&]() {
     ErrorContext context;
     if (!message.source_path.empty()) context.source_path = message.source_path;
@@ -392,10 +392,10 @@ std::optional<DecodedMessage> decode(const Message& message, const TypeRegistry&
   try {
     std::shared_ptr<void> object;
     if (message.connection->serialization_format == "cdr") {
-      object = support->deserialize_cdr(ByteView{message.bytes->data(), message.bytes->size()});
+      object = support->deserialize_cdr(ByteView{message.bytes->data(), message.bytes->size()}, limits);
     } else if (message.connection->serialization_format == "ros1" ||
                message.connection->serialization_format.empty()) {
-      object = support->deserialize_ros1(ByteView{message.bytes->data(), message.bytes->size()});
+      object = support->deserialize_ros1(ByteView{message.bytes->data(), message.bytes->size()}, limits);
     } else {
       throw UnsupportedFeature("unsupported message serialization format: " +
                                message.connection->serialization_format);

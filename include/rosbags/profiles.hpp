@@ -6,8 +6,8 @@
 #include "rosbags/rosbags.hpp"
 #include "rosbags/serialization.hpp"
 namespace rosbags::profiles {
-struct Time { std::int32_t sec = 0; std::uint32_t nanosec = 0; };
-struct Duration { std::int32_t sec = 0; std::uint32_t nanosec = 0; };
+struct Time { std::int64_t sec = 0; std::uint32_t nanosec = 0; };
+struct Duration { std::int32_t sec = 0; std::int64_t nanosec = 0; };
 namespace std_msgs {
 struct Header;
 struct Bool;
@@ -129,7 +129,7 @@ struct Bool {
 };
 
 struct Byte {
-  std::uint8_t data{};
+  std::int16_t data{};
 };
 
 struct MultiArrayDimension {
@@ -145,7 +145,7 @@ struct MultiArrayLayout {
 
 struct ByteMultiArray {
   ::rosbags::profiles::std_msgs::MultiArrayLayout layout{};
-  std::vector<std::uint8_t> data{};
+  std::vector<std::int16_t> data{};
 };
 
 struct Char {
@@ -759,7 +759,11 @@ using Quaternion = geometry_msgs::Quaternion;
 using Imu = sensor_msgs::Imu;
 using StdTime = std_msgs::Time;
 using StdDuration = std_msgs::Duration;
-namespace detail { using serialization::CdrReader; using serialization::Ros1Reader;
+namespace detail {
+using serialization::CdrReader;
+using serialization::Ros1Reader;
+using serialization::ReaderBase;
+using serialization::WireMinimum;
 void read_ros1(Ros1Reader&, ::rosbags::profiles::geometry_msgs::Vector3&);
 void read_cdr(CdrReader&, ::rosbags::profiles::geometry_msgs::Vector3&);
 void read_ros1(Ros1Reader&, ::rosbags::profiles::geometry_msgs::Accel&);
@@ -961,3 +965,5 @@ void read_cdr(CdrReader&, Duration&);
 void register_builtin_types(TypeRegistry&, std::string_view profile);
 void register_all_builtin_profiles(TypeRegistry&);
 }  // namespace rosbags::profiles
+
+#include "rosbags/profiles/wire_minimum.hpp"

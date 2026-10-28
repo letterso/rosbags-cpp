@@ -1,0 +1,4 @@
+struct Basic {
+  string<4> text;
+  sequence<string<4>, 2> labels;
+};

@@ -23,6 +23,7 @@ file(RENAME "${work}/original" "${prefix}")
 file(COPY "${SOURCE_DIR}/tests/install/" DESTINATION "${work}/consumer")
 run("${CMAKE_COMMAND}" -S "${work}/consumer" -B "${work}/build"
   "-DCMAKE_PREFIX_PATH=${prefix}" "-Dmcap_DIR=${SDK_CONFIG_DIR}" "-DROSBAGS_MCAP_ROOT=${SDK_PREFIX}"
+  "-DCMAKE_CXX_FLAGS=${CONSUMER_CXX_FLAGS}" "-DCMAKE_EXE_LINKER_FLAGS=${CONSUMER_EXE_LINKER_FLAGS}"
   "-DWITH_GENERATOR=${WITH_GENERATOR}" -DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF
   -DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=OFF)
 run("${CMAKE_COMMAND}" --build "${work}/build" ${config_args} -j2)
